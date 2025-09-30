@@ -138,19 +138,20 @@ class MapObject(QGraphicsItemGroup):
 
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
-        # Snap object's CENTER to the nearest cell center on release
+        scene = self.scene()
+        if scene is None:
+            return
         cs = self.cell_size
         w = self.spec.size_w * cs
         h = self.spec.size_h * cs
-        center_x = self.pos().x() + w / 2
-        center_y = self.pos().y() + h / 2
-        i = round(center_x / cs - 0.5)
-        j = round(center_y / cs - 0.5)
-        snapped_center_x = (i + 0.5) * cs
-        snapped_center_y = (j + 0.5) * cs
-        new_x = snapped_center_x - w / 2
-        new_y = snapped_center_y - h / 2
-        self.setPos(QPointF(new_x, new_y))
+        current_top_left = self.pos()
+        snapped_x = round(current_top_left.x() / cs) * cs
+        snapped_y = round(current_top_left.y() / cs) * cs
+        if isinstance(scene, MapScene):
+            top_left = scene._clamp_top_left(snapped_x, snapped_y, w, h)
+        else:
+            top_left = QPointF(snapped_x, snapped_y)
+        self.setPos(top_left)
 
 
 class PreviewObject(QGraphicsItemGroup):
@@ -219,6 +220,11 @@ class MapScene(QGraphicsScene):
     def scene_height(self) -> float:
         return float(self.sceneRect().height())
 
+    def _clamp_top_left(self, x: float, y: float, w: float, h: float) -> QPointF:
+        x = max(0, min(self.scene_width() - w, x))
+        y = max(0, min(self.scene_height() - h, y))
+        return QPointF(x, y)
+
     def _top_left_from_center_snap(self, scene_pos: QPointF) -> QPointF:
         cs = self.cell_size
         spec = self.active_spec
@@ -226,17 +232,11 @@ class MapScene(QGraphicsScene):
             return QPointF(0, 0)
         w = spec.size_w * cs
         h = spec.size_h * cs
-        # snap center to (i+0.5)*cs close to cursor
-        i = round(scene_pos.x() / cs - 0.5)
-        j = round(scene_pos.y() / cs - 0.5)
-        snapped_center_x = (i + 0.5) * cs
-        snapped_center_y = (j + 0.5) * cs
-        x = snapped_center_x - w / 2
-        y = snapped_center_y - h / 2
-        # clamp inside scene
-        x = max(0, min(self.scene_width() - w, x))
-        y = max(0, min(self.scene_height() - h, y))
-        return QPointF(x, y)
+        desired_top_left_x = scene_pos.x() - w / 2
+        desired_top_left_y = scene_pos.y() - h / 2
+        snapped_x = round(desired_top_left_x / cs) * cs
+        snapped_y = round(desired_top_left_y / cs) * cs
+        return self._clamp_top_left(snapped_x, snapped_y, w, h)
 
     # --- Placement tool API ---
     def set_active_spec(self, spec: Optional[ObjectSpec]):
@@ -314,6 +314,12 @@ class MapView(QGraphicsView):
 
         self._panning = False
         self._pan_start = QPointF()
+        self._rubber_selecting = False
+
+    def _map_object_from_item(self, item: Optional[QGraphicsItem]) -> Optional[MapObject]:
+        while item is not None and not isinstance(item, MapObject):
+            item = item.parentItem()
+        return item if isinstance(item, MapObject) else None
 
     def wheelEvent(self, event):
         # Zoom on wheel: Ctrl for fine steps
@@ -349,8 +355,30 @@ class MapView(QGraphicsView):
                 event.accept()
                 return
         # Pan with Middle mouse or Shift + Left
+        item_under_cursor = None
+        if event.button() == Qt.LeftButton:
+            item_under_cursor = self._map_object_from_item(
+                self.itemAt(event.position().toPoint())
+            )
+        if (
+            event.button() == Qt.LeftButton
+            and (event.modifiers() & Qt.ShiftModifier)
+            and scene.active_spec is None
+            and item_under_cursor is not None
+        ):
+            item_under_cursor.setSelected(True)
+            event.accept()
+            return
+        if event.button() == Qt.LeftButton and scene.active_spec is None and not (
+            event.modifiers() & Qt.ShiftModifier
+        ):
+            if item_under_cursor is None:
+                self.setDragMode(QGraphicsView.RubberBandDrag)
+                self._rubber_selecting = True
         if event.button() == Qt.MiddleButton or (
-            event.button() == Qt.LeftButton and (event.modifiers() & Qt.ShiftModifier)
+            event.button() == Qt.LeftButton
+            and (event.modifiers() & Qt.ShiftModifier)
+            and (item_under_cursor is None or scene.active_spec is not None)
         ):
             self._panning = True
             p = event.position()
@@ -382,6 +410,24 @@ class MapView(QGraphicsView):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+        if self._rubber_selecting and event.button() == Qt.LeftButton:
+            self.setDragMode(QGraphicsView.NoDrag)
+            self._rubber_selecting = False
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Delete:
+            scene: MapScene = self.scene()
+            to_remove: set[MapObject] = set()
+            for item in scene.selectedItems():
+                map_obj = self._map_object_from_item(item)
+                if map_obj is not None:
+                    to_remove.add(map_obj)
+            if to_remove:
+                for obj in to_remove:
+                    scene.removeItem(obj)
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
 
 # ----------------------------- Sidebar --------------------------------
@@ -561,14 +607,11 @@ class MainWindow(QMainWindow):
                 h = item.spec.size_h * v
                 item.rect_item.setRect(0, 0, w, h)
                 item.updateLabelLayout()
-                # Snap by center to grid centers
-                center_x = item.pos().x() + w / 2
-                center_y = item.pos().y() + h / 2
-                i = round(center_x / v - 0.5)
-                j = round(center_y / v - 0.5)
-                snapped_center_x = (i + 0.5) * v
-                snapped_center_y = (j + 0.5) * v
-                item.setPos(QPointF(snapped_center_x - w / 2, snapped_center_y - h / 2))
+                top_left = item.pos()
+                snapped_x = round(top_left.x() / v) * v
+                snapped_y = round(top_left.y() / v) * v
+                clamped = self.scene._clamp_top_left(snapped_x, snapped_y, w, h)
+                item.setPos(clamped)
             elif isinstance(item, PreviewObject):
                 item.update_for_cell_size(v)
         self.scene.update()
