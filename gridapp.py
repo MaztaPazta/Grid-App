@@ -254,13 +254,14 @@ class MapScene(QGraphicsScene):
         self.preview_item.setVisible(True)
         self.preview_item.setPos(self._top_left_from_center_snap(scene_pos))
 
-    def place_active_at(self, scene_pos: QPointF):
+    def place_active_at(self, scene_pos: QPointF) -> Optional[MapObject]:
         if self.active_spec is None:
-            return
+            return None
         pos = self._top_left_from_center_snap(scene_pos)
         obj = MapObject(self.active_spec, pos, self.cell_size)
         self.addItem(obj)
         obj.updateLabelLayout()
+        return obj
 
     # --- Painting ---
     def drawBackground(self, painter: QPainter, rect: QRectF):
@@ -321,6 +322,29 @@ class MapView(QGraphicsView):
         self.scale(factor, factor)
 
     def mousePressEvent(self, event):
+        scene: MapScene = self.scene()
+        if scene.active_spec is not None:
+            window = self.window()
+            if event.button() == Qt.RightButton:
+                if hasattr(window, "cancel_active_placement"):
+                    window.cancel_active_placement()
+                else:
+                    scene.cancel_placement()
+                event.accept()
+                return
+            if event.button() == Qt.LeftButton:
+                scene_pos = self.mapToScene(event.position().toPoint())
+                obj = scene.place_active_at(scene_pos)
+                if obj is not None:
+                    obj.setSelected(True)
+                keep_active = bool(event.modifiers() & Qt.ShiftModifier)
+                if not keep_active:
+                    if hasattr(window, "cancel_active_placement"):
+                        window.cancel_active_placement()
+                    else:
+                        scene.cancel_placement()
+                event.accept()
+                return
         # Pan with Middle mouse or Shift + Left
         if event.button() == Qt.MiddleButton or (
             event.button() == Qt.LeftButton and (event.modifiers() & Qt.ShiftModifier)
@@ -451,6 +475,14 @@ class MainWindow(QMainWindow):
     def refresh_active_preview_if(self, spec: ObjectSpec):
         if self.scene.active_spec is spec:
             self.scene.set_active_spec(spec)  # recreate preview with new name/color
+
+    def clear_placement_hint(self):
+        self.hint_label.setText("")
+
+    def cancel_active_placement(self):
+        if self.scene.active_spec is not None:
+            self.scene.cancel_placement()
+        self.clear_placement_hint()
 
     def toggle_grid(self, checked: bool):
         self.scene.show_grid = checked
