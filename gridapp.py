@@ -50,8 +50,11 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMessageBox,
     QSpinBox,
+    QTabWidget,
     QToolBar,
+    QToolButton,
 )
 
 
@@ -71,12 +74,14 @@ class ObjectSpec:
     fill: QColor = field(default_factory=lambda: QColor(Qt.lightGray))
 
 
-PALETTE: list[ObjectSpec] = [
-    ObjectSpec("Base", 3, 3, QColor(Qt.lightGray)),
-    ObjectSpec("Outpost", 2, 2, QColor(Qt.cyan)),
-    ObjectSpec("Resource", 2, 1, QColor(Qt.yellow)),
-    ObjectSpec("Relay", 1, 1, QColor(Qt.green)),
-]
+DEFAULT_CATEGORIES: dict[str, list[ObjectSpec]] = {
+    "Alliance": [
+        ObjectSpec("Base", 3, 3, QColor(Qt.lightGray)),
+        ObjectSpec("Outpost", 2, 2, QColor(Qt.cyan)),
+        ObjectSpec("Resource", 2, 1, QColor(Qt.yellow)),
+        ObjectSpec("Relay", 1, 1, QColor(Qt.green)),
+    ]
+}
 
 
 # ----------------------------- Map Items -------------------------------
@@ -381,8 +386,9 @@ class MapView(QGraphicsView):
 
 # ----------------------------- Sidebar --------------------------------
 class PaletteList(QListWidget):
-    def __init__(self, parent=None):
+    def __init__(self, specs: list[ObjectSpec], parent=None):
         super().__init__(parent)
+        self.specs = specs
         self.setAlternatingRowColors(True)
         self.populate()
         self.itemClicked.connect(self._on_item_clicked)
@@ -390,7 +396,7 @@ class PaletteList(QListWidget):
 
     def populate(self):
         self.clear()
-        for spec in PALETTE:
+        for spec in self.specs:
             item = QListWidgetItem(f"{spec.name}  ({spec.size_w}x{spec.size_h})")
             item.setData(Qt.UserRole, spec)
             self.addItem(item)
@@ -419,6 +425,62 @@ class PaletteList(QListWidget):
             w.refresh_active_preview_if(spec)
 
 
+# ---------------------------- Palette Tabs ----------------------------
+class PaletteTabWidget(QTabWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMovable(True)
+        self.tabBarDoubleClicked.connect(self._rename_category)
+
+        add_btn = QToolButton(self)
+        add_btn.setText("+")
+        add_btn.clicked.connect(self._prompt_new_category)
+        self.setCornerWidget(add_btn, Qt.TopRightCorner)
+
+        for name, specs in DEFAULT_CATEGORIES.items():
+            self.add_category(name, specs)
+
+    def add_category(self, name: str, specs: Optional[list[ObjectSpec]] = None):
+        if specs is None:
+            specs = []
+        list_widget = PaletteList(specs, self)
+        self.addTab(list_widget, name)
+        return list_widget
+
+    def _prompt_new_category(self):
+        name, ok = QInputDialog.getText(self, "Add Category", "Category name:")
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if self._category_exists(name):
+            QMessageBox.information(self, "Category exists", f"Category '{name}' already exists.")
+            return
+        self.add_category(name)
+
+    def _rename_category(self, index: int):
+        if index < 0:
+            return
+        current_name = self.tabText(index)
+        name, ok = QInputDialog.getText(self, "Rename Category", "Category name:", text=current_name)
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if name != current_name and self._category_exists(name):
+            QMessageBox.information(self, "Category exists", f"Category '{name}' already exists.")
+            return
+        self.setTabText(index, name)
+
+    def _category_exists(self, name: str) -> bool:
+        for i in range(self.count()):
+            if self.tabText(i).lower() == name.lower():
+                return True
+        return False
+
+
 # ----------------------------- Main Window -----------------------------
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -432,9 +494,9 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.view)
 
         # Sidebar (dock)
-        self.palette = PaletteList()
+        self.palette_tabs = PaletteTabWidget(self)
         dock = QDockWidget("Objects", self)
-        dock.setWidget(self.palette)
+        dock.setWidget(self.palette_tabs)
         dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self.addDockWidget(Qt.LeftDockWidgetArea, dock)
 
