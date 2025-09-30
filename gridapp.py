@@ -1,20 +1,18 @@
-"""
-Last War Survivor — Alliance Map Tool (Python, PySide6)
-------------------------------------------------------
-
-Fixes in this version
-- Removed Space modifier (Qt has none). **Pan = Middle mouse** or **Shift + Left**.
-- Removed all drag-and-drop code; placement uses a **preview tool**.
-- Fixed dataclass mutable default (`QColor`) using `default_factory`.
-- Replaced deprecated `.pos()` with `.position()`.
-- Objects & preview are **above** the grid; placement is **centered under cursor**.
-- Status coordinates use **1,1 at bottom-left**.
-- Double-click items in **Objects** to edit **default name** & **color**.
-
-Run
-- Install: `pip install PySide6`
-- Start: `python app.py`
-"""
+# Last War Survivor — Alliance Map Tool (Python, PySide6)
+# ------------------------------------------------------
+#
+# Fixes in this version
+# - Removed Space modifier (Qt has none). **Pan = Middle mouse** or **Shift + Left**.
+# - Removed all drag-and-drop code; placement uses a **preview tool**.
+# - Fixed dataclass mutable default (`QColor`) using `default_factory`.
+# - Replaced deprecated `.pos()` with `.position()`.
+# - Objects & preview are **above** the grid; placement is **centered under cursor**.
+# - Status coordinates use **1,1 at bottom-left**.
+# - Double-click items in **Objects** to edit **default name** & **color**.
+#
+# Run
+# - Install: `pip install PySide6`
+# - Start: `python app.py`
 from __future__ import annotations
 
 import math
