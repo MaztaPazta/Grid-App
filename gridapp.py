@@ -55,6 +55,8 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QToolBar,
     QToolButton,
+    QHBoxLayout,
+    QWidget,
 )
 
 
@@ -91,10 +93,16 @@ class MapObject(QGraphicsItemGroup):
         self.spec = spec
         self.cell_size = cell_size
 
-        w = spec.size_w * cell_size
-        h = spec.size_h * cell_size
+        # Individual properties copied from spec so each placed object can be
+        # customized without mutating the shared template.
+        self.width_cells = spec.size_w
+        self.height_cells = spec.size_h
+        self.fill_color = QColor(spec.fill)
+
+        w = self.width_cells * cell_size
+        h = self.height_cells * cell_size
         rect_item = QGraphicsRectItem(0, 0, w, h)
-        rect_item.setBrush(QBrush(spec.fill))
+        rect_item.setBrush(QBrush(self.fill_color))
         rect_item.setPen(QPen(Qt.black, 1))
 
         label = QGraphicsSimpleTextItem(spec.name)
@@ -121,27 +129,25 @@ class MapObject(QGraphicsItemGroup):
         # Ensure above any future overlays; grid is drawn in background
         self.setZValue(1000)
         self.setPos(top_left)
+        self.update_geometry()
 
     def updateLabelLayout(self):
-        w = self.spec.size_w * self.cell_size
-        h = self.spec.size_h * self.cell_size
+        w = self.width_cells * self.cell_size
+        h = self.height_cells * self.cell_size
         label_rect = self.label_item.boundingRect()
         self.label_item.setPos((w - label_rect.width()) / 2, (h - label_rect.height()) / 2)
 
-    def mouseDoubleClickEvent(self, event):
-        # Rename via dialog
-        new_name, ok = QInputDialog.getText(None, "Rename object", "Enter name:", text=self.label_item.text())
-        if ok and new_name.strip():
-            self.label_item.setText(new_name.strip())
-            self.updateLabelLayout()
-        super().mouseDoubleClickEvent(event)
+    def update_geometry(self):
+        w = self.width_cells * self.cell_size
+        h = self.height_cells * self.cell_size
+        self.rect_item.setRect(0, 0, w, h)
+        self.rect_item.setBrush(QBrush(self.fill_color))
+        self.updateLabelLayout()
 
-    def mouseReleaseEvent(self, event):
-        super().mouseReleaseEvent(event)
-        # Snap object's CENTER to the nearest cell center on release
+    def snap_to_grid(self):
         cs = self.cell_size
-        w = self.spec.size_w * cs
-        h = self.spec.size_h * cs
+        w = self.width_cells * cs
+        h = self.height_cells * cs
         center_x = self.pos().x() + w / 2
         center_y = self.pos().y() + h / 2
         i = round(center_x / cs - 0.5)
@@ -151,6 +157,66 @@ class MapObject(QGraphicsItemGroup):
         new_x = snapped_center_x - w / 2
         new_y = snapped_center_y - h / 2
         self.setPos(QPointF(new_x, new_y))
+
+    def mouseDoubleClickEvent(self, event):
+        self.edit_properties()
+        super().mouseDoubleClickEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        scene = self.scene()
+        targets: list[MapObject]
+        if scene is not None:
+            selected = [item for item in scene.selectedItems() if isinstance(item, MapObject)]
+            if len(selected) > 1 and self in selected:
+                targets = selected
+            else:
+                targets = [self]
+        else:
+            targets = [self]
+        for item in targets:
+            item.snap_to_grid()
+
+    def edit_properties(self):
+        parent = None
+        scene = self.scene()
+        if scene is not None and scene.views():
+            parent = scene.views()[0].window()
+
+        new_name, ok = QInputDialog.getText(
+            parent, "Edit object name", "Enter name:", text=self.label_item.text()
+        )
+        if ok and new_name.strip():
+            self.label_item.setText(new_name.strip())
+
+        width, ok = QInputDialog.getInt(
+            parent,
+            "Edit width",
+            "Width (cells):",
+            self.width_cells,
+            1,
+            999,
+        )
+        if ok:
+            self.width_cells = width
+
+        height, ok = QInputDialog.getInt(
+            parent,
+            "Edit height",
+            "Height (cells):",
+            self.height_cells,
+            1,
+            999,
+        )
+        if ok:
+            self.height_cells = height
+
+        color = QColorDialog.getColor(self.fill_color, parent, "Choose color")
+        if color.isValid():
+            self.fill_color = QColor(color)
+
+        self.update_geometry()
+        self.snap_to_grid()
 
 
 class PreviewObject(QGraphicsItemGroup):
@@ -413,10 +479,30 @@ class PaletteList(QListWidget):
         new_name, ok = QInputDialog.getText(self, "Edit default name", "Name:", text=spec.name)
         if ok and new_name.strip():
             spec.name = new_name.strip()
+        width, ok = QInputDialog.getInt(
+            self,
+            "Edit default width",
+            "Width (cells):",
+            spec.size_w,
+            1,
+            999,
+        )
+        if ok:
+            spec.size_w = width
+        height, ok = QInputDialog.getInt(
+            self,
+            "Edit default height",
+            "Height (cells):",
+            spec.size_h,
+            1,
+            999,
+        )
+        if ok:
+            spec.size_h = height
         # Edit color
         color = QColorDialog.getColor(spec.fill, self, "Choose color")
         if color.isValid():
-            spec.fill = color
+            spec.fill = QColor(color)
         # Update list label
         item.setText(f"{spec.name}  ({spec.size_w}x{spec.size_h})")
         # If this spec is active, refresh preview
@@ -432,10 +518,23 @@ class PaletteTabWidget(QTabWidget):
         self.setMovable(True)
         self.tabBarDoubleClicked.connect(self._rename_category)
 
-        add_btn = QToolButton(self)
-        add_btn.setText("+")
-        add_btn.clicked.connect(self._prompt_new_category)
-        self.setCornerWidget(add_btn, Qt.TopRightCorner)
+        corner_widget = QWidget(self)
+        layout = QHBoxLayout(corner_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        add_category_btn = QToolButton(corner_widget)
+        add_category_btn.setText("+")
+        add_category_btn.setToolTip("Add category")
+        add_category_btn.clicked.connect(self._prompt_new_category)
+        layout.addWidget(add_category_btn)
+
+        add_object_btn = QToolButton(corner_widget)
+        add_object_btn.setText("+Obj")
+        add_object_btn.setToolTip("Add object to current category")
+        add_object_btn.clicked.connect(self._prompt_new_object)
+        layout.addWidget(add_object_btn)
+
+        self.setCornerWidget(corner_widget, Qt.TopRightCorner)
 
         for name, specs in DEFAULT_CATEGORIES.items():
             self.add_category(name, specs)
@@ -459,6 +558,28 @@ class PaletteTabWidget(QTabWidget):
             return
         self.add_category(name)
 
+    def _prompt_new_object(self):
+        index = self.currentIndex()
+        if index < 0:
+            return
+        name, ok = QInputDialog.getText(self, "Add Object", "Object name:")
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        width, ok = QInputDialog.getInt(self, "Add Object", "Width (cells):", 1, 1, 999)
+        if not ok:
+            return
+        height, ok = QInputDialog.getInt(self, "Add Object", "Height (cells):", 1, 1, 999)
+        if not ok:
+            return
+        color = QColorDialog.getColor(QColor(Qt.lightGray), self, "Choose color")
+        if not color.isValid():
+            return
+        spec = ObjectSpec(name, width, height, QColor(color))
+        self.add_object_to_index(index, spec)
+
     def _rename_category(self, index: int):
         if index < 0:
             return
@@ -477,6 +598,21 @@ class PaletteTabWidget(QTabWidget):
     def _category_exists(self, name: str) -> bool:
         for i in range(self.count()):
             if self.tabText(i).lower() == name.lower():
+                return True
+        return False
+
+    def add_object_to_tab(self, name: str, spec: ObjectSpec) -> bool:
+        for i in range(self.count()):
+            if self.tabText(i).lower() == name.lower():
+                return self.add_object_to_index(i, spec)
+        return False
+
+    def add_object_to_index(self, index: int, spec: ObjectSpec) -> bool:
+        if 0 <= index < self.count():
+            widget = self.widget(index)
+            if isinstance(widget, PaletteList):
+                widget.specs.append(spec)
+                widget.populate()
                 return True
         return False
 
@@ -557,18 +693,8 @@ class MainWindow(QMainWindow):
         for item in self.scene.items():
             if isinstance(item, MapObject):
                 item.cell_size = v
-                w = item.spec.size_w * v
-                h = item.spec.size_h * v
-                item.rect_item.setRect(0, 0, w, h)
-                item.updateLabelLayout()
-                # Snap by center to grid centers
-                center_x = item.pos().x() + w / 2
-                center_y = item.pos().y() + h / 2
-                i = round(center_x / v - 0.5)
-                j = round(center_y / v - 0.5)
-                snapped_center_x = (i + 0.5) * v
-                snapped_center_y = (j + 0.5) * v
-                item.setPos(QPointF(snapped_center_x - w / 2, snapped_center_y - h / 2))
+                item.update_geometry()
+                item.snap_to_grid()
             elif isinstance(item, PreviewObject):
                 item.update_for_cell_size(v)
         self.scene.update()
