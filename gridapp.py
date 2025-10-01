@@ -19,7 +19,7 @@ import math
 import sys
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Callable, ClassVar, Dict, Iterable, List, Optional, Set
 
 from PySide6.QtCore import (
     QEvent,
@@ -124,6 +124,9 @@ class MemberData:
     map_object: Optional["MapObject"] = None
     template_id: str = field(init=False)
 
+    _palette_lookup: ClassVar[Optional[Callable[[str], Optional[QColor]]]] = None
+    _rank_color_cache: ClassVar[Dict[str, QColor]] = {}
+
     def __post_init__(self):
         self.template_id = f"member:{self.member_id}"
 
@@ -134,6 +137,19 @@ class MemberData:
         return f"{self.rank} {self.name}"
 
     def rank_color(self) -> QColor:
+        cls = self.__class__
+        cached = cls._rank_color_cache.get(self.rank)
+        if cached is not None:
+            return QColor(cached)
+
+        lookup = cls._palette_lookup
+        if lookup is not None:
+            palette_color = lookup(self.rank)
+            if palette_color is not None and palette_color.isValid():
+                color_copy = QColor(palette_color)
+                cls._rank_color_cache[self.rank] = QColor(color_copy)
+                return color_copy
+
         color = RANK_COLORS.get(self.rank)
         return QColor(color) if color is not None else QColor(Qt.lightGray)
 
@@ -148,6 +164,24 @@ class MemberData:
             limit_key=self.template_id,
             template_id=self.template_id,
         )
+
+    @classmethod
+    def set_palette_lookup(
+        cls, lookup: Optional[Callable[[str], Optional[QColor]]]
+    ) -> None:
+        cls._palette_lookup = lookup
+        cls._rank_color_cache.clear()
+
+    @classmethod
+    def update_rank_color_cache(cls, rank: str, color: Optional[QColor]) -> None:
+        if color is None:
+            cls._rank_color_cache.pop(rank, None)
+        else:
+            cls._rank_color_cache[rank] = QColor(color)
+
+    @classmethod
+    def clear_rank_color_cache(cls) -> None:
+        cls._rank_color_cache.clear()
 
 
 @dataclass
@@ -1382,6 +1416,12 @@ class PaletteList(QListWidget):
             label += f"  [max {spec.limit} — {key_display}]"
         return label
 
+    def find_spec_by_name(self, name: str) -> Optional[ObjectSpec]:
+        for spec in self.specs:
+            if spec.name == name:
+                return spec
+        return None
+
     def _refresh_item_display(self, item: QListWidgetItem, spec: ObjectSpec) -> None:
         item.setText(self._item_label(spec))
         item.setIcon(create_color_icon(spec.fill))
@@ -1518,6 +1558,15 @@ class PaletteList(QListWidget):
             if changed:
                 w.offer_apply_spec_changes(spec, previous)
             w.refresh_active_preview_if(spec)
+        if changed:
+            self._notify_spec_changed(spec, previous)
+
+    def _notify_spec_changed(self, spec: ObjectSpec, previous: dict) -> None:
+        parent = self.parent()
+        while parent is not None and not isinstance(parent, PaletteTabWidget):
+            parent = parent.parent()
+        if isinstance(parent, PaletteTabWidget):
+            parent.handle_spec_changed(spec, previous)
 
 
 class ZoneList(QListWidget):
@@ -1596,6 +1645,7 @@ class AllianceMembersTab(QWidget):
         self._selected_member_id: Optional[str] = None
         self._deferred_select_id: Optional[str] = None
         self._deferred_activate = False
+        self._palette_widget: Optional["PaletteTabWidget"] = None
 
         layout = QVBoxLayout(self)
 
@@ -1633,6 +1683,20 @@ class AllianceMembersTab(QWidget):
         self.sort_checkbox.stateChanged.connect(self._refresh_list)
 
         self._refresh_list()
+
+    def set_palette_widget(self, palette: Optional["PaletteTabWidget"]):
+        if self._palette_widget is palette:
+            return
+        if self._palette_widget is not None:
+            try:
+                self._palette_widget.rank_spec_changed.disconnect(
+                    self._on_rank_spec_changed
+                )
+            except TypeError:
+                pass
+        self._palette_widget = palette
+        if self._palette_widget is not None:
+            self._palette_widget.rank_spec_changed.connect(self._on_rank_spec_changed)
 
     def _refresh_list(self, *args):
         select_id = self._deferred_select_id
@@ -1813,6 +1877,16 @@ class AllianceMembersTab(QWidget):
         obj.spec.fill = QColor(color)
         obj.rect_item.setBrush(QBrush(obj.spec.fill))
         obj._last_valid_pos = QPointF(obj.pos())
+
+    def _on_rank_spec_changed(self, rank: str):
+        for member in self.members:
+            if member.rank == rank:
+                self._update_member_map_object(member)
+        window = self.window()
+        if isinstance(window, MainWindow):
+            active_member = getattr(window, "active_member", None)
+            if isinstance(active_member, MemberData) and active_member.rank == rank:
+                window.activate_member(active_member)
 
     def get_member(self, member_id: Optional[str]) -> Optional[MemberData]:
         if member_id is None:
@@ -2181,6 +2255,8 @@ class AllianceWidget(QTabWidget):
 
 # ---------------------------- Palette Tabs ----------------------------
 class PaletteTabWidget(QTabWidget):
+    rank_spec_changed = Signal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMovable(True)
@@ -2207,6 +2283,27 @@ class PaletteTabWidget(QTabWidget):
 
         for name, specs in DEFAULT_CATEGORIES.items():
             self.add_category(name, specs)
+
+    def rank_template_color(self, rank: str) -> Optional[QColor]:
+        for i in range(self.count()):
+            widget = self.widget(i)
+            if isinstance(widget, PaletteList):
+                spec = widget.find_spec_by_name(rank)
+                if spec is not None:
+                    return QColor(spec.fill)
+        return None
+
+    def handle_spec_changed(self, spec: ObjectSpec, previous: dict) -> None:
+        ranks_to_update: Set[str] = set()
+        if spec.name in RANK_ORDER:
+            ranks_to_update.add(spec.name)
+        previous_name = previous.get("name")
+        if isinstance(previous_name, str) and previous_name in RANK_ORDER:
+            ranks_to_update.add(previous_name)
+        for rank in ranks_to_update:
+            color = self.rank_template_color(rank)
+            MemberData.update_rank_color_cache(rank, color)
+            self.rank_spec_changed.emit(rank)
 
     def add_category(self, name: str, specs: Optional[list[ObjectSpec]] = None):
         if specs is None:
@@ -2317,6 +2414,7 @@ class MainWindow(QMainWindow):
 
         # Sidebar (dock)
         self.palette_tabs = PaletteTabWidget(self)
+        MemberData.set_palette_lookup(self.palette_tabs.rank_template_color)
         self.object_dock = QDockWidget("Objects", self)
         self.object_dock.setWidget(self.palette_tabs)
         self.object_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
@@ -2329,6 +2427,7 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.LeftDockWidgetArea, self.zone_dock)
 
         self.alliance_widget = AllianceWidget(self)
+        self.alliance_widget.members_tab.set_palette_widget(self.palette_tabs)
         self.alliance_dock = QDockWidget("Alliance", self)
         self.alliance_dock.setWidget(self.alliance_widget)
         self.alliance_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
