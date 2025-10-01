@@ -7,7 +7,7 @@
 # - Fixed dataclass mutable default (`QColor`) using `default_factory`.
 # - Replaced deprecated `.pos()` with `.position()`.
 # - Objects & preview are **above** the grid; placement is **centered under cursor**.
-# - Status coordinates use **1,1 at bottom-left**.
+# - Status coordinates use **0,0 at bottom-left**.
 # - Double-click items in **Objects** to edit **default name** & **color**.
 #
 # Run
@@ -23,6 +23,7 @@ from typing import Callable, ClassVar, Dict, Iterable, List, Optional, Set
 
 from PySide6.QtCore import (
     QEvent,
+    QPoint,
     QPointF,
     QRectF,
     Qt,
@@ -74,7 +75,7 @@ from PySide6.QtWidgets import (
 
 
 # ----------------------------- Config ---------------------------------
-GRID_CELLS = 999  # 999x999
+GRID_CELLS = 1000  # 1000x1000
 CELL_SIZE = 20    # pixels per cell (zoom lets you navigate efficiently)
 GRID_COLOR = Qt.gray
 GRID_THICK_COLOR = Qt.darkGray
@@ -1000,14 +1001,17 @@ class MapScene(QGraphicsScene):
         rect = obj.bounding_rect_scene()
         return self.is_area_free_for_object(rect, obj)
 
-    def count_objects_with_key(self, key: Optional[str]) -> int:
+    def objects_with_key(self, key: Optional[str]) -> list[MapObject]:
         if not key:
-            return 0
-        count = 0
+            return []
+        matches: list[MapObject] = []
         for item in self.items():
             if isinstance(item, MapObject) and item.spec.limit_key == key:
-                count += 1
-        return count
+                matches.append(item)
+        return matches
+
+    def count_objects_with_key(self, key: Optional[str]) -> int:
+        return len(self.objects_with_key(key))
 
     # --- Placement tool API ---
     def set_active_spec(self, spec: Optional[ObjectSpec]):
@@ -1031,14 +1035,19 @@ class MapScene(QGraphicsScene):
     def place_active_at(self, scene_pos: QPointF) -> Optional[QGraphicsItemGroup]:
         if self.active_spec is None:
             return None
-        if self.active_spec.limit is not None:
-            limit_key = self.active_spec.limit_key or self.active_spec.name
-            existing = self.count_objects_with_key(limit_key)
-            if existing >= self.active_spec.limit:
+        limit = self.active_spec.limit
+        limit_key = self.active_spec.limit_key or self.active_spec.name
+        if limit is not None:
+            existing_items = self.objects_with_key(limit_key)
+            if limit == 1 and existing_items:
+                for item in existing_items:
+                    self.remove_map_item(item)
+                existing_items = []
+            if len(existing_items) >= limit:
                 QMessageBox.information(
                     None,
                     "Limit reached",
-                    f"Cannot place more than {self.active_spec.limit} instance(s) of {limit_key}.",
+                    f"Cannot place more than {limit} instance(s) of {limit_key}.",
                 )
                 return None
         pos = self._top_left_from_center_snap(scene_pos)
@@ -1249,6 +1258,14 @@ class MapScene(QGraphicsScene):
                 self._zones.remove(item)
             self.zone_removed.emit(item)
 
+    def remove_objects_by_template(self, template_id: str) -> int:
+        removed = 0
+        for item in list(self.items()):
+            if isinstance(item, MapObject) and item.spec.template_id == template_id:
+                self.remove_map_item(item)
+                removed += 1
+        return removed
+
     # --- Painting ---
     def drawBackground(self, painter: QPainter, rect: QRectF):
         # Fill background; grid lines handled by dedicated item so they can appear above zones
@@ -1426,14 +1443,13 @@ class PaletteList(QListWidget):
         self.populate()
         self.itemClicked.connect(self._on_item_clicked)
         self.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._on_context_menu)
 
     def populate(self):
         self.clear()
         for spec in self.specs:
-            item = QListWidgetItem(self._item_label(spec))
-            item.setData(Qt.UserRole, spec)
-            item.setIcon(create_color_icon(spec.fill))
-            self.addItem(item)
+            self.addItem(self._create_item(spec))
 
     def _item_label(self, spec: ObjectSpec) -> str:
         label = f"{spec.name}  ({spec.size_w}x{spec.size_h})"
@@ -1441,6 +1457,19 @@ class PaletteList(QListWidget):
             key_display = spec.limit_key or spec.name
             label += f"  [max {spec.limit} — {key_display}]"
         return label
+
+    def _create_item(self, spec: ObjectSpec) -> QListWidgetItem:
+        item = QListWidgetItem(self._item_label(spec))
+        item.setData(Qt.UserRole, spec)
+        item.setIcon(create_color_icon(spec.fill))
+        return item
+
+    def add_spec(self, spec: ObjectSpec) -> QListWidgetItem:
+        if not any(existing is spec for existing in self.specs):
+            self.specs.append(spec)
+        item = self._create_item(spec)
+        self.addItem(item)
+        return item
 
     def find_spec_by_name(self, name: str) -> Optional[ObjectSpec]:
         for spec in self.specs:
@@ -1466,11 +1495,38 @@ class PaletteList(QListWidget):
     def _refresh_item_display(self, item: QListWidgetItem, spec: ObjectSpec) -> None:
         item.setText(self._item_label(spec))
         item.setIcon(create_color_icon(spec.fill))
+        self.viewport().update()
 
     def refresh_spec_item(self, spec: ObjectSpec) -> None:
         item = self._item_for_spec(spec)
         if item is not None:
             self._refresh_item_display(item, spec)
+
+    def _capture_spec_state(self, spec: ObjectSpec) -> dict:
+        return {
+            "name": spec.name,
+            "fill": QColor(spec.fill),
+            "size_w": spec.size_w,
+            "size_h": spec.size_h,
+            "limit": spec.limit,
+            "limit_key": spec.limit_key,
+        }
+
+    def _finalize_spec_change(
+        self,
+        item: QListWidgetItem,
+        spec: ObjectSpec,
+        previous: dict,
+        changed: bool,
+    ) -> None:
+        self._refresh_item_display(item, spec)
+        w = self.window()
+        if isinstance(w, MainWindow):
+            if changed:
+                w.offer_apply_spec_changes(spec, previous)
+            w.refresh_active_preview_if(spec)
+        if changed:
+            self._notify_spec_changed(spec, previous)
 
     def _on_item_clicked(self, item: QListWidgetItem):
         spec: ObjectSpec = item.data(Qt.UserRole)
@@ -1480,14 +1536,7 @@ class PaletteList(QListWidget):
 
     def _on_item_double_clicked(self, item: QListWidgetItem):
         spec: ObjectSpec = item.data(Qt.UserRole)
-        previous = {
-            "name": spec.name,
-            "fill": QColor(spec.fill),
-            "size_w": spec.size_w,
-            "size_h": spec.size_h,
-            "limit": spec.limit,
-            "limit_key": spec.limit_key,
-        }
+        previous = self._capture_spec_state(spec)
         changed = False
         # Edit default text
         new_name, ok = QInputDialog.getText(self, "Edit default name", "Name:", text=spec.name)
@@ -1596,16 +1645,7 @@ class PaletteList(QListWidget):
             if spec.limit_key != new_limit_key:
                 spec.limit_key = new_limit_key
                 changed = True
-        # Update list label/icon
-        self._refresh_item_display(item, spec)
-        # If this spec is active, refresh preview
-        w = self.window()
-        if isinstance(w, MainWindow):
-            if changed:
-                w.offer_apply_spec_changes(spec, previous)
-            w.refresh_active_preview_if(spec)
-        if changed:
-            self._notify_spec_changed(spec, previous)
+        self._finalize_spec_change(item, spec, previous, changed)
 
     def _notify_spec_changed(self, spec: ObjectSpec, previous: dict) -> None:
         parent = self.parent()
@@ -1613,6 +1653,60 @@ class PaletteList(QListWidget):
             parent = parent.parent()
         if isinstance(parent, PaletteTabWidget):
             parent.handle_spec_changed(spec, previous)
+
+    def _change_item_color(self, item: QListWidgetItem, spec: ObjectSpec) -> None:
+        previous = self._capture_spec_state(spec)
+        color = QColorDialog.getColor(spec.fill, self, "Choose color")
+        if color.isValid() and color != spec.fill:
+            spec.fill = QColor(color)
+            self._finalize_spec_change(item, spec, previous, True)
+
+    def _clear_objects_for_spec(self, spec: ObjectSpec) -> None:
+        window = self.window()
+        if not isinstance(window, MainWindow):
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Remove Objects",
+            f"Remove all placed '{spec.name}' objects from the map?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        removed = window.remove_objects_for_spec(spec)
+        if removed == 0:
+            QMessageBox.information(
+                self,
+                "No objects removed",
+                f"There are no '{spec.name}' objects on the map.",
+            )
+
+    def _on_context_menu(self, pos: QPoint) -> None:
+        item = self.itemAt(pos)
+        menu = QMenu(self)
+        if item is None:
+            add_action = menu.addAction("Add Object...")
+            chosen = menu.exec(self.mapToGlobal(pos))
+            if chosen == add_action:
+                parent = self.parent()
+                while parent is not None and not isinstance(parent, PaletteTabWidget):
+                    parent = parent.parent()
+                if isinstance(parent, PaletteTabWidget):
+                    parent._prompt_new_object()
+            return
+
+        spec: ObjectSpec = item.data(Qt.UserRole)
+        change_color_action = menu.addAction("Change Color...")
+        edit_action = menu.addAction("Edit...")
+        clear_action = menu.addAction("Remove All from Map")
+        chosen = menu.exec(self.mapToGlobal(pos))
+        if chosen == change_color_action:
+            self._change_item_color(item, spec)
+        elif chosen == edit_action:
+            self._on_item_double_clicked(item)
+        elif chosen == clear_action:
+            self._clear_objects_for_spec(spec)
 
 
 class ZoneList(QListWidget):
@@ -2383,9 +2477,9 @@ class PaletteTabWidget(QTabWidget):
         widget = self.widget(tab_index)
         if not isinstance(widget, PaletteList):
             raise TypeError("Tab widget is not a PaletteList")
-        widget.specs.append(spec)
-        widget.populate()
-        widget.setCurrentRow(widget.count() - 1)
+        item = widget.add_spec(spec)
+        widget.setCurrentItem(item)
+        widget.scrollToItem(item)
 
     def _prompt_new_object(self):
         index = self.currentIndex()
@@ -2681,6 +2775,9 @@ class MainWindow(QMainWindow):
             )
         self.scene.update()
 
+    def remove_objects_for_spec(self, spec: ObjectSpec) -> int:
+        return self.scene.remove_objects_by_template(spec.template_id)
+
     def clear_placement_hint(self):
         self.hint_label.setText("")
 
@@ -2751,11 +2848,11 @@ class MainWindow(QMainWindow):
                 cells = self.scene.cells
                 x_raw = max(0.0, min(self.scene.scene_width(), float(scene_pos.x())))
                 y_raw = max(0.0, min(self.scene.scene_height(), float(scene_pos.y())))
-                # 1-based X, bottom-left-origin Y (invert Y)
-                cx = int(x_raw // cs) + 1
-                cy = int((self.scene.scene_height() - y_raw) // cs) + 1
-                cx = max(1, min(cells, cx))
-                cy = max(1, min(cells, cy))
+                # 0-based X, bottom-left-origin Y (invert Y)
+                cx = int(x_raw // cs)
+                cy = int((self.scene.scene_height() - y_raw) // cs)
+                cx = max(0, min(cells - 1, cx))
+                cy = max(0, min(cells - 1, cy))
                 self.coord_label.setText(f"x: {cx}, y: {cy}")
                 self.scene.update_preview(scene_pos)
                 self.scene.update_zone_hover(scene_pos)
