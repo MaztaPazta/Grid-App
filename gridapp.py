@@ -74,6 +74,15 @@ class ObjectSpec:
     fill: QColor = field(default_factory=lambda: QColor(Qt.lightGray))
 
 
+@dataclass
+class ZoneSpec:
+    name: str
+    size_w: int = 1
+    size_h: int = 1
+    fill: QColor = field(default_factory=lambda: QColor(255, 0, 0, 60))
+    edge: QColor = field(default_factory=lambda: QColor(Qt.red))
+
+
 DEFAULT_CATEGORIES: dict[str, list[ObjectSpec]] = {
     "Alliance": [
         ObjectSpec("Base", 3, 3, QColor(Qt.lightGray)),
@@ -84,8 +93,24 @@ DEFAULT_CATEGORIES: dict[str, list[ObjectSpec]] = {
 }
 
 
+DEFAULT_ZONES: list[ZoneSpec] = [
+    ZoneSpec("Safe", 5, 5, QColor(0, 255, 0, 60), QColor(Qt.green)),
+    ZoneSpec("Danger", 6, 6, QColor(255, 0, 0, 60), QColor(Qt.red)),
+]
+
+
 def clone_spec(spec: ObjectSpec) -> ObjectSpec:
     return ObjectSpec(spec.name, spec.size_w, spec.size_h, QColor(spec.fill))
+
+
+def clone_zone_spec(spec: ZoneSpec) -> ZoneSpec:
+    return ZoneSpec(
+        spec.name,
+        spec.size_w,
+        spec.size_h,
+        QColor(spec.fill),
+        QColor(spec.edge),
+    )
 
 
 # ----------------------------- Map Items -------------------------------
@@ -94,6 +119,7 @@ class MapObject(QGraphicsItemGroup):
         super().__init__()
         self.spec = spec
         self.cell_size = cell_size
+        self._last_valid_pos = QPointF(top_left)
 
         w = spec.size_w * cell_size
         h = spec.size_h * cell_size
@@ -126,6 +152,15 @@ class MapObject(QGraphicsItemGroup):
         self.setZValue(1000)
         self.setPos(top_left)
 
+    def bounding_rect_scene(self) -> QRectF:
+        w = self.spec.size_w * self.cell_size
+        h = self.spec.size_h * self.cell_size
+        return QRectF(self.pos().x(), self.pos().y(), w, h)
+
+    def mousePressEvent(self, event):
+        self._drag_start_pos = QPointF(self.pos())
+        super().mousePressEvent(event)
+
     def updateLabelLayout(self):
         w = self.spec.size_w * self.cell_size
         h = self.spec.size_h * self.cell_size
@@ -153,6 +188,8 @@ class MapObject(QGraphicsItemGroup):
         if isinstance(scene, MapScene):
             max_size = scene.cells
 
+        old_w = self.spec.size_w
+        old_h = self.spec.size_h
         width, ok_w = QInputDialog.getInt(
             None,
             "Width",
@@ -182,7 +219,23 @@ class MapObject(QGraphicsItemGroup):
             self.rect_item.setRect(0, 0, w, h)
             self.updateLabelLayout()
             if isinstance(scene, MapScene):
-                scene.snap_map_objects_to_grid([self])
+                scene.snap_items_to_grid([self])
+                if not scene.is_object_position_free(self):
+                    self.spec.size_w = old_w
+                    self.spec.size_h = old_h
+                    self.cell_size = scene.cell_size
+                    w = self.spec.size_w * self.cell_size
+                    h = self.spec.size_h * self.cell_size
+                    self.rect_item.setRect(0, 0, w, h)
+                    self.updateLabelLayout()
+                    scene.snap_items_to_grid([self])
+                    QMessageBox.information(
+                        None,
+                        "Overlap",
+                        "Cannot resize object because it would overlap another object.",
+                    )
+                else:
+                    self._last_valid_pos = QPointF(self.pos())
             else:
                 current_top_left = self.pos()
                 snapped_x = round(current_top_left.x() / self.cell_size) * self.cell_size
@@ -200,7 +253,16 @@ class MapObject(QGraphicsItemGroup):
             map_objects = [item for item in scene.selectedItems() if isinstance(item, MapObject)]
             if not map_objects:
                 map_objects = [self]
-            scene.snap_map_objects_to_grid(map_objects)
+            scene.snap_items_to_grid(map_objects)
+            for obj in map_objects:
+                if not scene.is_object_position_free(obj):
+                    # revert to last valid position
+                    revert_pos = getattr(obj, "_drag_start_pos", obj._last_valid_pos)
+                    obj.setPos(revert_pos)
+                    scene.snap_items_to_grid([obj])
+                    obj._last_valid_pos = QPointF(obj.pos())
+                else:
+                    obj._last_valid_pos = QPointF(obj.pos())
         else:
             cs = self.cell_size
             current_top_left = self.pos()
@@ -252,6 +314,235 @@ class PreviewObject(QGraphicsItemGroup):
         self.label_item.setPos((w - label_rect.width()) / 2, (h - label_rect.height()) / 2)
 
 
+class MapZone(QGraphicsItemGroup):
+    def __init__(self, spec: ZoneSpec, top_left: QPointF, cell_size: int):
+        super().__init__()
+        self.spec = spec
+        self.cell_size = cell_size
+
+        w = spec.size_w * cell_size
+        h = spec.size_h * cell_size
+
+        rect_item = QGraphicsRectItem(0, 0, w, h)
+        rect_item.setBrush(QBrush(spec.fill))
+        rect_item.setPen(QPen(spec.edge, 2))
+
+        label = QGraphicsSimpleTextItem(spec.name)
+        label.setBrush(Qt.black)
+        font = QFont()
+        font.setPointSizeF(max(8.0, cell_size * 0.4))
+        label.setFont(font)
+        label_rect = label.boundingRect()
+        label.setPos((w - label_rect.width()) / 2, (h - label_rect.height()) / 2)
+
+        self.addToGroup(rect_item)
+        self.addToGroup(label)
+        self.rect_item = rect_item
+        self.label_item = label
+
+        self.setFlags(
+            QGraphicsItem.ItemIsMovable
+            | QGraphicsItem.ItemIsSelectable
+            | QGraphicsItem.ItemSendsGeometryChanges
+        )
+        self.setZValue(100)  # below objects but above background fill
+        self.setPos(top_left)
+
+    def bounding_rect_scene(self) -> QRectF:
+        w = self.spec.size_w * self.cell_size
+        h = self.spec.size_h * self.cell_size
+        return QRectF(self.pos().x(), self.pos().y(), w, h)
+
+    def updateLabelLayout(self):
+        w = self.spec.size_w * self.cell_size
+        h = self.spec.size_h * self.cell_size
+        label_rect = self.label_item.boundingRect()
+        self.label_item.setPos((w - label_rect.width()) / 2, (h - label_rect.height()) / 2)
+
+    def mouseDoubleClickEvent(self, event):
+        new_name, ok = QInputDialog.getText(
+            None, "Edit zone", "Enter name:", text=self.label_item.text()
+        )
+        if ok and new_name.strip():
+            final_name = new_name.strip()
+            self.spec.name = final_name
+            self.label_item.setText(final_name)
+            self.updateLabelLayout()
+
+        fill_color = QColorDialog.getColor(self.spec.fill, None, "Choose fill color")
+        if fill_color.isValid():
+            self.spec.fill = QColor(fill_color)
+            self.rect_item.setBrush(QBrush(self.spec.fill))
+
+        edge_color = QColorDialog.getColor(self.spec.edge, None, "Choose edge color")
+        if edge_color.isValid():
+            self.spec.edge = QColor(edge_color)
+            pen = self.rect_item.pen()
+            pen.setColor(self.spec.edge)
+            self.rect_item.setPen(pen)
+
+        scene = self.scene()
+        max_size = GRID_CELLS
+        if isinstance(scene, MapScene):
+            max_size = scene.cells
+
+        old_w = self.spec.size_w
+        old_h = self.spec.size_h
+
+        width, ok_w = QInputDialog.getInt(
+            None,
+            "Width",
+            "Width (cells):",
+            value=self.spec.size_w,
+            min=1,
+            max=max_size,
+        )
+        height, ok_h = (self.spec.size_h, False)
+        if ok_w:
+            height, ok_h = QInputDialog.getInt(
+                None,
+                "Height",
+                "Height (cells):",
+                value=self.spec.size_h,
+                min=1,
+                max=max_size,
+            )
+
+        if ok_w and ok_h:
+            self.spec.size_w = width
+            self.spec.size_h = height
+            if isinstance(scene, MapScene):
+                self.cell_size = scene.cell_size
+            w = self.spec.size_w * self.cell_size
+            h = self.spec.size_h * self.cell_size
+            self.rect_item.setRect(0, 0, w, h)
+            self.updateLabelLayout()
+            if isinstance(scene, MapScene):
+                scene.snap_items_to_grid([self])
+            else:
+                current_top_left = self.pos()
+                snapped_x = round(current_top_left.x() / self.cell_size) * self.cell_size
+                snapped_y = round(current_top_left.y() / self.cell_size) * self.cell_size
+                self.setPos(QPointF(snapped_x, snapped_y))
+        else:
+            self.spec.size_w = old_w
+            self.spec.size_h = old_h
+
+        super().mouseDoubleClickEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        scene = self.scene()
+        if scene is None:
+            return
+        if isinstance(scene, MapScene):
+            zones = [item for item in scene.selectedItems() if isinstance(item, MapZone)]
+            if not zones:
+                zones = [self]
+            scene.snap_items_to_grid(zones)
+        else:
+            cs = self.cell_size
+            current_top_left = self.pos()
+            snapped_x = round(current_top_left.x() / cs) * cs
+            snapped_y = round(current_top_left.y() / cs) * cs
+            self.setPos(QPointF(snapped_x, snapped_y))
+
+
+class PreviewZone(QGraphicsItemGroup):
+    def __init__(self, spec: ZoneSpec, cell_size: int):
+        super().__init__()
+        self.spec = spec
+        self.cell_size = cell_size
+
+        w = spec.size_w * cell_size
+        h = spec.size_h * cell_size
+        rect_item = QGraphicsRectItem(0, 0, w, h)
+        rect_item.setBrush(QBrush(spec.fill))
+        pen = QPen(spec.edge, 2)
+        pen.setStyle(Qt.DashLine)
+        rect_item.setPen(pen)
+
+        label = QGraphicsSimpleTextItem(spec.name)
+        font = QFont()
+        font.setPointSizeF(max(8.0, cell_size * 0.4))
+        label.setFont(font)
+        label_rect = label.boundingRect()
+        label.setPos((w - label_rect.width()) / 2, (h - label_rect.height()) / 2)
+
+        self.addToGroup(rect_item)
+        self.addToGroup(label)
+        self.rect_item = rect_item
+        self.label_item = label
+
+        self.setOpacity(0.35)
+        self.setZValue(900)
+        self.setAcceptedMouseButtons(Qt.NoButton)
+
+    def update_for_cell_size(self, cell_size: int):
+        self.cell_size = cell_size
+        w = self.spec.size_w * cell_size
+        h = self.spec.size_h * cell_size
+        self.rect_item.setRect(0, 0, w, h)
+        font = self.label_item.font()
+        font.setPointSizeF(max(8.0, cell_size * 0.4))
+        self.label_item.setFont(font)
+        label_rect = self.label_item.boundingRect()
+        self.label_item.setPos((w - label_rect.width()) / 2, (h - label_rect.height()) / 2)
+
+class GridLinesItem(QGraphicsItem):
+    def __init__(self, map_scene: "MapScene"):
+        super().__init__()
+        self.map_scene = map_scene
+        self._rect = QRectF(0, 0, map_scene.scene_width(), map_scene.scene_height())
+        self.setZValue(500)
+        self.setAcceptedMouseButtons(Qt.NoButton)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, False)
+        self.setAcceptHoverEvents(False)
+
+    def update_geometry(self):
+        self.prepareGeometryChange()
+        self._rect = QRectF(0, 0, self.map_scene.scene_width(), self.map_scene.scene_height())
+
+    def boundingRect(self) -> QRectF:
+        return self._rect
+
+    def contains(self, point: QPointF) -> bool:
+        return False
+
+    def paint(self, painter: QPainter, option, widget=None):
+        if not self.map_scene.show_grid:
+            return
+        rect = option.exposedRect if option is not None else self._rect
+        rect = rect.intersected(self._rect)
+        cs = self.map_scene.cell_size
+        left = int(math.floor(rect.left() / cs))
+        right = int(math.ceil(rect.right() / cs))
+        top = int(math.floor(rect.top() / cs))
+        bottom = int(math.ceil(rect.bottom() / cs))
+
+        pen_fine = QPen(GRID_COLOR)
+        pen_fine.setWidth(1)
+        painter.setPen(pen_fine)
+        for x in range(left, right + 1):
+            px = x * cs
+            painter.drawLine(px, rect.top(), px, rect.bottom())
+        for y in range(top, bottom + 1):
+            py = y * cs
+            painter.drawLine(rect.left(), py, rect.right(), py)
+
+        pen_thick = QPen(GRID_THICK_COLOR)
+        pen_thick.setWidth(2)
+        painter.setPen(pen_thick)
+        for x in range(left, right + 1):
+            if x % 10 == 0:
+                px = x * cs
+                painter.drawLine(px, rect.top(), px, rect.bottom())
+        for y in range(top, bottom + 1):
+            if y % 10 == 0:
+                py = y * cs
+                painter.drawLine(rect.left(), py, rect.right(), py)
+
+
 # ----------------------------- Scene/View ------------------------------
 class MapScene(QGraphicsScene):
     def __init__(self, cells: int, cell_size: int, parent=None):
@@ -265,8 +556,12 @@ class MapScene(QGraphicsScene):
         self.setItemIndexMethod(QGraphicsScene.NoIndex)
 
         # Placement tool state
-        self.active_spec: Optional[ObjectSpec] = None
-        self.preview_item: Optional[PreviewObject] = None
+        self.active_spec: Optional[ObjectSpec | ZoneSpec] = None
+        self.active_is_zone = False
+        self.preview_item: Optional[QGraphicsItemGroup] = None
+        self.grid_item = GridLinesItem(self)
+        self.addItem(self.grid_item)
+        self.grid_item.setVisible(self.show_grid)
 
     # --- Helpers ---
     def scene_width(self) -> float:
@@ -293,10 +588,10 @@ class MapScene(QGraphicsScene):
         snapped_y = round(desired_top_left_y / cs) * cs
         return self._clamp_top_left(snapped_x, snapped_y, w, h)
 
-    def snap_map_objects_to_grid(self, objects: Iterable[MapObject]):
+    def snap_items_to_grid(self, objects: Iterable[QGraphicsItemGroup]):
         cs = self.cell_size
         for obj in objects:
-            if not isinstance(obj, MapObject):
+            if not isinstance(obj, (MapObject, MapZone)):
                 continue
             obj.cell_size = cs
             w = obj.spec.size_w * cs
@@ -307,14 +602,33 @@ class MapScene(QGraphicsScene):
             top_left = self._clamp_top_left(snapped_x, snapped_y, w, h)
             obj.setPos(top_left)
 
+    def is_area_free_for_object(self, rect: QRectF, ignore_item: Optional[QGraphicsItemGroup] = None) -> bool:
+        for item in self.items():
+            if not isinstance(item, MapObject):
+                continue
+            if item is ignore_item:
+                continue
+            item_rect = item.bounding_rect_scene()
+            if rect.intersects(item_rect):
+                return False
+        return True
+
+    def is_object_position_free(self, obj: MapObject) -> bool:
+        rect = obj.bounding_rect_scene()
+        return self.is_area_free_for_object(rect, obj)
+
     # --- Placement tool API ---
-    def set_active_spec(self, spec: Optional[ObjectSpec]):
+    def set_active_spec(self, spec: Optional[ObjectSpec | ZoneSpec], is_zone: bool = False):
         if self.preview_item is not None:
             self.removeItem(self.preview_item)
             self.preview_item = None
         self.active_spec = spec
+        self.active_is_zone = bool(spec is not None and is_zone)
         if spec is not None:
-            self.preview_item = PreviewObject(spec, self.cell_size)
+            if self.active_is_zone and isinstance(spec, ZoneSpec):
+                self.preview_item = PreviewZone(spec, self.cell_size)
+            else:
+                self.preview_item = PreviewObject(spec, self.cell_size)  # type: ignore[arg-type]
             self.addItem(self.preview_item)
 
     def cancel_placement(self):
@@ -326,50 +640,35 @@ class MapScene(QGraphicsScene):
         self.preview_item.setVisible(True)
         self.preview_item.setPos(self._top_left_from_center_snap(scene_pos))
 
-    def place_active_at(self, scene_pos: QPointF) -> Optional[MapObject]:
+    def place_active_at(self, scene_pos: QPointF) -> Optional[QGraphicsItemGroup]:
         if self.active_spec is None:
             return None
         pos = self._top_left_from_center_snap(scene_pos)
+        if self.active_is_zone and isinstance(self.active_spec, ZoneSpec):
+            zone = MapZone(clone_zone_spec(self.active_spec), pos, self.cell_size)
+            self.addItem(zone)
+            zone.updateLabelLayout()
+            return zone
+        assert isinstance(self.active_spec, ObjectSpec)
+        rect = QRectF(
+            pos.x(),
+            pos.y(),
+            self.active_spec.size_w * self.cell_size,
+            self.active_spec.size_h * self.cell_size,
+        )
+        if not self.is_area_free_for_object(rect):
+            QMessageBox.information(None, "Overlap", "Cannot place object on top of another object.")
+            return None
         obj = MapObject(clone_spec(self.active_spec), pos, self.cell_size)
         self.addItem(obj)
         obj.updateLabelLayout()
+        obj._last_valid_pos = QPointF(obj.pos())
         return obj
 
     # --- Painting ---
     def drawBackground(self, painter: QPainter, rect: QRectF):
-        # Draw grid behind items
+        # Fill background; grid lines handled by dedicated item so they can appear above zones
         painter.fillRect(rect, QBrush(BACKGROUND_COLOR))
-        if not self.show_grid:
-            return
-        cs = self.cell_size
-        left = int(math.floor(rect.left() / cs))
-        right = int(math.ceil(rect.right() / cs))
-        top = int(math.floor(rect.top() / cs))
-        bottom = int(math.ceil(rect.bottom() / cs))
-
-        # Fine grid
-        pen_fine = QPen(GRID_COLOR)
-        pen_fine.setWidth(1)
-        painter.setPen(pen_fine)
-        for x in range(left, right + 1):
-            px = x * cs
-            painter.drawLine(px, rect.top(), px, rect.bottom())
-        for y in range(top, bottom + 1):
-            py = y * cs
-            painter.drawLine(rect.left(), py, rect.right(), py)
-
-        # Thicker lines every 10 cells
-        pen_thick = QPen(GRID_THICK_COLOR)
-        pen_thick.setWidth(2)
-        painter.setPen(pen_thick)
-        for x in range(left, right + 1):
-            if x % 10 == 0:
-                px = x * cs
-                painter.drawLine(px, rect.top(), px, rect.bottom())
-        for y in range(top, bottom + 1):
-            if y % 10 == 0:
-                py = y * cs
-                painter.drawLine(rect.left(), py, rect.right(), py)
 
 
 class MapView(QGraphicsView):
@@ -385,10 +684,12 @@ class MapView(QGraphicsView):
         self._pan_start = QPointF()
         self._rubber_selecting = False
 
-    def _map_object_from_item(self, item: Optional[QGraphicsItem]) -> Optional[MapObject]:
-        while item is not None and not isinstance(item, MapObject):
+    def _map_item_from_graphics_item(
+        self, item: Optional[QGraphicsItem]
+    ) -> Optional[QGraphicsItemGroup]:
+        while item is not None and not isinstance(item, (MapObject, MapZone)):
             item = item.parentItem()
-        return item if isinstance(item, MapObject) else None
+        return item if isinstance(item, (MapObject, MapZone)) else None
 
     def wheelEvent(self, event):
         # Zoom on wheel: Ctrl for fine steps
@@ -426,7 +727,7 @@ class MapView(QGraphicsView):
         # Pan with Middle mouse or Shift + Left
         item_under_cursor = None
         if event.button() == Qt.LeftButton:
-            item_under_cursor = self._map_object_from_item(
+            item_under_cursor = self._map_item_from_graphics_item(
                 self.itemAt(event.position().toPoint())
             )
         if (
@@ -486,9 +787,9 @@ class MapView(QGraphicsView):
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Delete:
             scene: MapScene = self.scene()
-            to_remove: set[MapObject] = set()
+            to_remove: set[QGraphicsItemGroup] = set()
             for item in scene.selectedItems():
-                map_obj = self._map_object_from_item(item)
+                map_obj = self._map_item_from_graphics_item(item)
                 if map_obj is not None:
                     to_remove.add(map_obj)
             if to_remove:
@@ -557,6 +858,70 @@ class PaletteList(QListWidget):
         # Update list label
         item.setText(f"{spec.name}  ({spec.size_w}x{spec.size_h})")
         # If this spec is active, refresh preview
+        w = self.window()
+        if isinstance(w, MainWindow):
+            w.refresh_active_preview_if(spec)
+
+
+class ZoneList(QListWidget):
+    def __init__(self, specs: list[ZoneSpec], parent=None):
+        super().__init__(parent)
+        self.specs = specs
+        self.setAlternatingRowColors(True)
+        self.populate()
+        self.itemClicked.connect(self._on_item_clicked)
+        self.itemDoubleClicked.connect(self._on_item_double_clicked)
+
+    def populate(self):
+        self.clear()
+        for spec in self.specs:
+            item = QListWidgetItem(f"{spec.name}  ({spec.size_w}x{spec.size_h})")
+            item.setData(Qt.UserRole, spec)
+            self.addItem(item)
+
+    def _on_item_clicked(self, item: QListWidgetItem):
+        spec: ZoneSpec = item.data(Qt.UserRole)
+        w = self.window()
+        if isinstance(w, MainWindow):
+            w.activate_zone_placement(spec)
+
+    def _on_item_double_clicked(self, item: QListWidgetItem):
+        spec: ZoneSpec = item.data(Qt.UserRole)
+        new_name, ok = QInputDialog.getText(self, "Edit zone name", "Name:", text=spec.name)
+        if ok and new_name.strip():
+            spec.name = new_name.strip()
+
+        fill_color = QColorDialog.getColor(spec.fill, self, "Choose fill color")
+        if fill_color.isValid():
+            spec.fill = QColor(fill_color)
+
+        edge_color = QColorDialog.getColor(spec.edge, self, "Choose edge color")
+        if edge_color.isValid():
+            spec.edge = QColor(edge_color)
+
+        width, ok_w = QInputDialog.getInt(
+            self,
+            "Width",
+            "Width (cells):",
+            value=spec.size_w,
+            min=1,
+            max=GRID_CELLS,
+        )
+        height, ok_h = (spec.size_h, False)
+        if ok_w:
+            height, ok_h = QInputDialog.getInt(
+                self,
+                "Height",
+                "Height (cells):",
+                value=spec.size_h,
+                min=1,
+                max=GRID_CELLS,
+            )
+        if ok_w and ok_h:
+            spec.size_w = width
+            spec.size_h = height
+
+        item.setText(f"{spec.name}  ({spec.size_w}x{spec.size_h})")
         w = self.window()
         if isinstance(w, MainWindow):
             w.refresh_active_preview_if(spec)
@@ -641,10 +1006,16 @@ class MainWindow(QMainWindow):
 
         # Sidebar (dock)
         self.palette_tabs = PaletteTabWidget(self)
-        dock = QDockWidget("Objects", self)
-        dock.setWidget(self.palette_tabs)
-        dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
-        self.addDockWidget(Qt.LeftDockWidgetArea, dock)
+        self.object_dock = QDockWidget("Objects", self)
+        self.object_dock.setWidget(self.palette_tabs)
+        self.object_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.object_dock)
+
+        self.zone_list = ZoneList(DEFAULT_ZONES, self)
+        self.zone_dock = QDockWidget("Zones", self)
+        self.zone_dock.setWidget(self.zone_list)
+        self.zone_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.zone_dock)
 
         # Status bar with coordinates + hint
         self.coord_label = QLabel("x: -, y: -")
@@ -672,15 +1043,30 @@ class MainWindow(QMainWindow):
         self.spin_cell.valueChanged.connect(self.change_cell_size)
         toolbar.addWidget(self.spin_cell)
 
+        self.panel_toolbar = QToolBar("Panels", self)
+        self.addToolBar(self.panel_toolbar)
+        obj_action = self.object_dock.toggleViewAction()
+        obj_action.setText("Objects Panel")
+        zone_action = self.zone_dock.toggleViewAction()
+        zone_action.setText("Zones Panel")
+        self.panel_toolbar.addAction(obj_action)
+        self.panel_toolbar.addAction(zone_action)
+
     def activate_placement(self, spec: ObjectSpec):
-        self.scene.set_active_spec(spec)
+        self.scene.set_active_spec(spec, is_zone=False)
         self.hint_label.setText(
             f"Placing {spec.name}: Left-click to place, Shift+Click for multiple, Right-click to cancel"
         )
 
-    def refresh_active_preview_if(self, spec: ObjectSpec):
+    def activate_zone_placement(self, spec: ZoneSpec):
+        self.scene.set_active_spec(spec, is_zone=True)
+        self.hint_label.setText(
+            f"Placing zone {spec.name}: Left-click to place, Shift+Click for multiple, Right-click to cancel"
+        )
+
+    def refresh_active_preview_if(self, spec: ObjectSpec | ZoneSpec):
         if self.scene.active_spec is spec:
-            self.scene.set_active_spec(spec)  # recreate preview with new name/color
+            self.scene.set_active_spec(spec, is_zone=self.scene.active_is_zone)
 
     def clear_placement_hint(self):
         self.hint_label.setText("")
@@ -692,6 +1078,9 @@ class MainWindow(QMainWindow):
 
     def toggle_grid(self, checked: bool):
         self.scene.show_grid = checked
+        if hasattr(self.scene, "grid_item"):
+            self.scene.grid_item.setVisible(checked)
+            self.scene.grid_item.update()
         self.scene.update()
 
     def change_cell_size(self, v: int):
@@ -699,6 +1088,9 @@ class MainWindow(QMainWindow):
         self.scene.cell_size = v
         size_px = self.scene.cells * v
         self.scene.setSceneRect(0, 0, size_px, size_px)
+        if hasattr(self.scene, "grid_item"):
+            self.scene.grid_item.update_geometry()
+            self.scene.grid_item.update()
         # Update existing items
         for item in self.scene.items():
             if isinstance(item, MapObject):
@@ -712,7 +1104,18 @@ class MainWindow(QMainWindow):
                 snapped_y = round(top_left.y() / v) * v
                 clamped = self.scene._clamp_top_left(snapped_x, snapped_y, w, h)
                 item.setPos(clamped)
-            elif isinstance(item, PreviewObject):
+            elif isinstance(item, MapZone):
+                item.cell_size = v
+                w = item.spec.size_w * v
+                h = item.spec.size_h * v
+                item.rect_item.setRect(0, 0, w, h)
+                item.updateLabelLayout()
+                top_left = item.pos()
+                snapped_x = round(top_left.x() / v) * v
+                snapped_y = round(top_left.y() / v) * v
+                clamped = self.scene._clamp_top_left(snapped_x, snapped_y, w, h)
+                item.setPos(clamped)
+            elif isinstance(item, (PreviewObject, PreviewZone)):
                 item.update_for_cell_size(v)
         self.scene.update()
 
