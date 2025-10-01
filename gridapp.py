@@ -26,6 +26,7 @@ from PySide6.QtCore import (
     QPoint,
     QPointF,
     QRectF,
+    QSize,
     Qt,
     Signal,
 )
@@ -33,7 +34,7 @@ from PySide6.QtGui import (
     QAction,
     QBrush,
     QFont,
-    QGuiApplication,
+    QFontMetricsF,
     QCursor,
     QPainter,
     QPen,
@@ -49,6 +50,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QDockWidget,
     QColorDialog,
+    QButtonGroup,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -229,6 +231,45 @@ def clone_spec(spec: ObjectSpec) -> ObjectSpec:
 
 
 # ----------------------------- UI Helpers ------------------------------
+def fit_text_item_to_rect(
+    item: QGraphicsSimpleTextItem,
+    width: float,
+    height: float,
+    *,
+    min_point_size: float = 4.0,
+    padding: float = 4.0,
+) -> None:
+    """Scale the item's font so its bounding rect fits inside width/height."""
+
+    text = item.text()
+    if not text:
+        return
+
+    available_width = max(1.0, width - 2.0 * padding)
+    available_height = max(1.0, height - 2.0 * padding)
+    base_font = item.font()
+    low = min_point_size
+    high = max(low, min(200.0, min(available_width, available_height)))
+    best = low
+
+    # Binary search for best size; stop when precision is small
+    while high - low > 0.5:
+        mid = (low + high) / 2.0
+        test_font = QFont(base_font)
+        test_font.setPointSizeF(mid)
+        metrics = QFontMetricsF(test_font)
+        rect = metrics.boundingRect(text)
+        if rect.width() <= available_width and rect.height() <= available_height:
+            best = mid
+            low = mid
+        else:
+            high = mid
+
+    final_font = QFont(base_font)
+    final_font.setPointSizeF(max(min_point_size, best))
+    item.setFont(final_font)
+
+
 def create_color_icon(color: QColor, size: int = 16) -> QIcon:
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.transparent)
@@ -276,7 +317,7 @@ class MapObject(QGraphicsItemGroup):
         font = QFont()
         font.setPointSizeF(max(8.0, cell_size * 0.5))
         label.setFont(font)
-        # center text
+        fit_text_item_to_rect(label, w, h)
         label_rect = label.boundingRect()
         label.setPos((w - label_rect.width()) / 2, (h - label_rect.height()) / 2)
 
@@ -308,6 +349,7 @@ class MapObject(QGraphicsItemGroup):
     def updateLabelLayout(self):
         w = self.spec.size_w * self.cell_size
         h = self.spec.size_h * self.cell_size
+        fit_text_item_to_rect(self.label_item, w, h)
         label_rect = self.label_item.boundingRect()
         self.label_item.setPos((w - label_rect.width()) / 2, (h - label_rect.height()) / 2)
 
@@ -484,6 +526,7 @@ class PreviewObject(QGraphicsItemGroup):
         font = QFont()
         font.setPointSizeF(max(8.0, cell_size * 0.5))
         label.setFont(font)
+        fit_text_item_to_rect(label, w, h)
         label_rect = label.boundingRect()
         label.setPos((w - label_rect.width()) / 2, (h - label_rect.height()) / 2)
 
@@ -504,6 +547,7 @@ class PreviewObject(QGraphicsItemGroup):
         font = self.label_item.font()
         font.setPointSizeF(max(8.0, cell_size * 0.5))
         self.label_item.setFont(font)
+        fit_text_item_to_rect(self.label_item, w, h)
         label_rect = self.label_item.boundingRect()
         self.label_item.setPos((w - label_rect.width()) / 2, (h - label_rect.height()) / 2)
 
@@ -582,6 +626,169 @@ class ZoneCoordinateDialog(QDialog):
         )
 
 
+ZONE_CORNER_HANDLE_SIZE = 12
+ZONE_EDGE_HANDLE_WIDTH = 20
+ZONE_EDGE_HANDLE_THICKNESS = 6
+
+
+class ZoneResizeHandle(QGraphicsRectItem):
+    def __init__(self, zone: "MapZone", role: str):
+        self.zone = zone
+        self.role = role
+        if role in ("top", "bottom"):
+            w = ZONE_EDGE_HANDLE_WIDTH
+            h = ZONE_EDGE_HANDLE_THICKNESS
+        elif role in ("left", "right"):
+            w = ZONE_EDGE_HANDLE_THICKNESS
+            h = ZONE_EDGE_HANDLE_WIDTH
+        else:
+            w = ZONE_CORNER_HANDLE_SIZE
+            h = ZONE_CORNER_HANDLE_SIZE
+        super().__init__(-w / 2, -h / 2, w, h)
+        self.setParentItem(zone)
+        self.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+        self.setAcceptedMouseButtons(Qt.LeftButton)
+        self.setZValue(zone.zValue() + 2)
+        self._start_context: Optional[dict] = None
+        self._changed = False
+        self._update_brush()
+        self.setCursor(self._cursor_for_role(role))
+
+    def _cursor_for_role(self, role: str):
+        if role in ("top-left", "bottom-right"):
+            return Qt.SizeFDiagCursor
+        if role in ("top-right", "bottom-left"):
+            return Qt.SizeBDiagCursor
+        if role in ("top", "bottom"):
+            return Qt.SizeVerCursor
+        return Qt.SizeHorCursor
+
+    def _update_brush(self):
+        color = QColor(self.zone.spec.edge)
+        brush = QBrush(color)
+        self.setBrush(brush)
+        pen = QPen(Qt.black)
+        pen.setWidth(1)
+        self.setPen(pen)
+
+    def update_position(self, width: float, height: float):
+        positions = {
+            "top-left": QPointF(0.0, 0.0),
+            "top": QPointF(width / 2.0, 0.0),
+            "top-right": QPointF(width, 0.0),
+            "right": QPointF(width, height / 2.0),
+            "bottom-right": QPointF(width, height),
+            "bottom": QPointF(width / 2.0, height),
+            "bottom-left": QPointF(0.0, height),
+            "left": QPointF(0.0, height / 2.0),
+        }
+        self.setPos(positions[self.role])
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            event.ignore()
+            return
+        zone = self.zone
+        scene = zone.scene()
+        if not zone.isSelected():
+            zone.setSelected(True)
+        cs = zone.cell_size
+        cells = GRID_CELLS
+        if isinstance(scene, MapScene):
+            cs = scene.cell_size
+            cells = scene.cells
+        left_cells = int(round(zone.pos().x() / cs))
+        top_cells = int(round(zone.pos().y() / cs))
+        self._start_context = {
+            "cs": cs,
+            "cells": cells,
+            "left": left_cells,
+            "top": top_cells,
+            "right": left_cells + zone.spec.size_w,
+            "bottom": top_cells + zone.spec.size_h,
+        }
+        self._changed = False
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._start_context is None:
+            event.ignore()
+            return
+        ctx = self._start_context
+        cs = ctx["cs"]
+        cells = ctx["cells"]
+        left = ctx["left"]
+        top = ctx["top"]
+        right = ctx["right"]
+        bottom = ctx["bottom"]
+
+        scene_pos = event.scenePos()
+        new_left = left
+        new_top = top
+        new_right = right
+        new_bottom = bottom
+
+        if "left" in self.role:
+            new_left = int(round(scene_pos.x() / cs))
+            new_left = max(0, min(new_left, new_right - 1))
+        if "right" in self.role:
+            new_right = int(round(scene_pos.x() / cs))
+            new_right = max(new_left + 1, min(cells, new_right))
+        if "top" in self.role:
+            new_top = int(round(scene_pos.y() / cs))
+            new_top = max(0, min(new_top, new_bottom - 1))
+        if "bottom" in self.role:
+            new_bottom = int(round(scene_pos.y() / cs))
+            new_bottom = max(new_top + 1, min(cells, new_bottom))
+
+        new_right = max(new_left + 1, min(cells, new_right))
+        new_bottom = max(new_top + 1, min(cells, new_bottom))
+
+        self._apply_resize(new_left, new_top, new_right, new_bottom)
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if self._start_context is not None:
+            if self._changed:
+                self.zone._emit_zone_updated()
+            self.zone._update_handles_geometry()
+        self._start_context = None
+        self._changed = False
+        event.accept()
+
+    def _apply_resize(self, left_cells: int, top_cells: int, right_cells: int, bottom_cells: int):
+        ctx = self._start_context
+        if ctx is None:
+            return
+        zone = self.zone
+        cs = ctx["cs"]
+        width_cells = max(1, right_cells - left_cells)
+        height_cells = max(1, bottom_cells - top_cells)
+        if (
+            width_cells == zone.spec.size_w
+            and height_cells == zone.spec.size_h
+            and left_cells == ctx["left"]
+            and top_cells == ctx["top"]
+        ):
+            zone._update_handles_geometry()
+            return
+
+        zone.spec.size_w = width_cells
+        zone.spec.size_h = height_cells
+        zone.cell_size = cs
+        w = width_cells * cs
+        h = height_cells * cs
+        zone.rect_item.setRect(0, 0, w, h)
+        zone.setPos(QPointF(left_cells * cs, top_cells * cs))
+        zone.updateLabelLayout()
+        zone._update_handles_geometry()
+        ctx["left"] = left_cells
+        ctx["top"] = top_cells
+        ctx["right"] = left_cells + width_cells
+        ctx["bottom"] = top_cells + height_cells
+        self._changed = True
+
+
 class MapZone(QGraphicsItemGroup):
     def __init__(self, spec: ZoneSpec, top_left: QPointF, cell_size: int):
         super().__init__()
@@ -616,6 +823,12 @@ class MapZone(QGraphicsItemGroup):
         self.setZValue(100)  # below objects but above background fill
         self.setPos(top_left)
 
+        self._handles: list[ZoneResizeHandle] = []
+        self._create_resize_handles()
+        self._update_handles_geometry()
+        self._update_handle_visibility(False)
+        self._set_selection_pen(False)
+
     def bounding_rect_scene(self) -> QRectF:
         w = self.spec.size_w * self.cell_size
         h = self.spec.size_h * self.cell_size
@@ -626,6 +839,49 @@ class MapZone(QGraphicsItemGroup):
         h = self.spec.size_h * self.cell_size
         label_rect = self.label_item.boundingRect()
         self.label_item.setPos((w - label_rect.width()) / 2, (h - label_rect.height()) / 2)
+        self._update_handles_geometry()
+
+    def _create_resize_handles(self):
+        roles = [
+            "top-left",
+            "top",
+            "top-right",
+            "right",
+            "bottom-right",
+            "bottom",
+            "bottom-left",
+            "left",
+        ]
+        self._handles = [ZoneResizeHandle(self, role) for role in roles]
+        self._update_handle_colors()
+
+    def _update_handles_geometry(self):
+        if not self._handles:
+            return
+        w = self.spec.size_w * self.cell_size
+        h = self.spec.size_h * self.cell_size
+        for handle in self._handles:
+            handle.update_position(w, h)
+
+    def _update_handle_visibility(self, visible: bool):
+        for handle in self._handles:
+            handle.setVisible(visible)
+
+    def _update_handle_colors(self):
+        for handle in self._handles:
+            handle._update_brush()
+
+    def _set_selection_pen(self, selected: bool):
+        pen = self.rect_item.pen()
+        pen.setWidth(4 if selected else 2)
+        self.rect_item.setPen(pen)
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.ItemSelectedHasChanged:
+            selected = bool(value)
+            self._update_handle_visibility(selected)
+            self._set_selection_pen(selected)
+        return super().itemChange(change, value)
 
     def mouseDoubleClickEvent(self, event):
         self._prompt_rename()
@@ -665,6 +921,7 @@ class MapZone(QGraphicsItemGroup):
             pen = self.rect_item.pen()
             pen.setColor(self.spec.edge)
             self.rect_item.setPen(pen)
+            self._update_handle_colors()
             self._emit_zone_updated()
             return True
         return False
@@ -705,6 +962,7 @@ class MapZone(QGraphicsItemGroup):
         h = self.spec.size_h * self.cell_size
         self.rect_item.setRect(0, 0, w, h)
         self.updateLabelLayout()
+        self._update_handles_geometry()
         if isinstance(scene, MapScene):
             scene.snap_items_to_grid([self])
         else:
@@ -791,6 +1049,7 @@ class MapZone(QGraphicsItemGroup):
         h = self.spec.size_h * cs
         self.rect_item.setRect(0, 0, w, h)
         self.updateLabelLayout()
+        self._update_handles_geometry()
 
         new_pos = QPointF(x_bl * cs, top_left_y_cells * cs)
         if isinstance(scene, MapScene):
@@ -1176,6 +1435,7 @@ class MapScene(QGraphicsScene):
             h = zone.spec.size_h * self.cell_size
             zone.rect_item.setRect(0, 0, w, h)
             zone.updateLabelLayout()
+            zone._update_handles_geometry()
             clamped = self._clamp_top_left(top_left.x(), top_left.y(), w, h)
             zone.setPos(clamped)
             zone.setVisible(True)
@@ -1195,6 +1455,7 @@ class MapScene(QGraphicsScene):
         zone = MapZone(spec, top_left, self.cell_size)
         self.addItem(zone)
         zone.updateLabelLayout()
+        zone._update_handles_geometry()
         self._zones.append(zone)
         self.zone_created.emit(zone)
         return zone
@@ -1440,6 +1701,7 @@ class PaletteList(QListWidget):
         super().__init__(parent)
         self.specs = specs
         self.setAlternatingRowColors(True)
+        self.setIconSize(QSize(20, 20))
         self.populate()
         self.itemClicked.connect(self._on_item_clicked)
         self.itemDoubleClicked.connect(self._on_item_double_clicked)
@@ -1461,7 +1723,11 @@ class PaletteList(QListWidget):
     def _create_item(self, spec: ObjectSpec) -> QListWidgetItem:
         item = QListWidgetItem(self._item_label(spec))
         item.setData(Qt.UserRole, spec)
-        item.setIcon(create_color_icon(spec.fill))
+        icon_size = self.iconSize()
+        icon_dim = max(icon_size.width(), icon_size.height(), 16)
+        icon = create_color_icon(spec.fill, icon_dim)
+        item.setIcon(icon)
+        item.setData(Qt.DecorationRole, icon.pixmap(icon_dim, icon_dim))
         return item
 
     def add_spec(self, spec: ObjectSpec) -> QListWidgetItem:
@@ -1494,7 +1760,11 @@ class PaletteList(QListWidget):
 
     def _refresh_item_display(self, item: QListWidgetItem, spec: ObjectSpec) -> None:
         item.setText(self._item_label(spec))
-        item.setIcon(create_color_icon(spec.fill))
+        icon_size = self.iconSize()
+        icon_dim = max(icon_size.width(), icon_size.height(), 16)
+        icon = create_color_icon(spec.fill, icon_dim)
+        item.setIcon(icon)
+        item.setData(Qt.DecorationRole, icon.pixmap(icon_dim, icon_dim))
         self.viewport().update()
 
     def refresh_spec_item(self, spec: ObjectSpec) -> None:
@@ -1777,6 +2047,82 @@ class ZoneList(QListWidget):
         self.update_zone_item(zone)
 
 
+class AddMemberDialog(QDialog):
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        initial_name: str = "",
+        initial_rank: str = "R1",
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Add Member")
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Member name:", self))
+        self.name_edit = QLineEdit(self)
+        self.name_edit.setText(initial_name)
+        layout.addWidget(self.name_edit)
+
+        layout.addWidget(QLabel("Starting rank:", self))
+        self.rank_group = QButtonGroup(self)
+        self.rank_group.setExclusive(True)
+        self._rank_checkboxes: list[QCheckBox] = []
+        for rank in RANK_ORDER:
+            checkbox = QCheckBox(rank, self)
+            checkbox.toggled.connect(self._on_checkbox_toggled)
+            self.rank_group.addButton(checkbox)
+            layout.addWidget(checkbox)
+            self._rank_checkboxes.append(checkbox)
+            if rank == initial_rank:
+                checkbox.setChecked(True)
+
+        if self.rank_group.checkedButton() is None and self._rank_checkboxes:
+            self._rank_checkboxes[0].setChecked(True)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_checkbox_toggled(self, checked: bool) -> None:
+        if not checked:
+            if not any(box.isChecked() for box in self._rank_checkboxes):
+                sender = self.sender()
+                if isinstance(sender, QCheckBox):
+                    sender.blockSignals(True)
+                    sender.setChecked(True)
+                    sender.blockSignals(False)
+            return
+        sender = self.sender()
+        if not isinstance(sender, QCheckBox):
+            return
+        for box in self._rank_checkboxes:
+            if box is sender:
+                continue
+            if box.isChecked():
+                box.blockSignals(True)
+                box.setChecked(False)
+                box.blockSignals(False)
+
+    def selected_rank(self) -> str:
+        button = self.rank_group.checkedButton()
+        if isinstance(button, QCheckBox):
+            return button.text()
+        return RANK_ORDER[0]
+
+    def get_data(self) -> tuple[str, str]:
+        return self.name_edit.text().strip(), self.selected_rank()
+
+    def accept(self) -> None:
+        if not self.name_edit.text().strip():
+            QMessageBox.information(self, "Missing name", "Enter a member name.")
+            self.name_edit.setFocus()
+            return
+        if self.rank_group.checkedButton() is None and self._rank_checkboxes:
+            self._rank_checkboxes[0].setChecked(True)
+        super().accept()
+
+
 class AllianceMembersTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1886,13 +2232,19 @@ class AllianceMembersTab(QWidget):
             window.activate_member(member)
 
     def _add_member(self):
-        name, ok = QInputDialog.getText(self, "Add Member", "Member name:")
-        if not ok:
-            return
-        name = name.strip()
-        if not name:
-            return
-        member = MemberData(name=name)
+        name_value = ""
+        rank_value = "R1"
+        while True:
+            dialog = AddMemberDialog(self, name_value, rank_value)
+            if dialog.exec() != QDialog.Accepted:
+                return
+            name_value, rank_value = dialog.get_data()
+            if not name_value:
+                continue
+            if not self._can_assign_rank(rank_value, None):
+                continue
+            member = MemberData(name=name_value, rank=rank_value)
+            break
         self.members.append(member)
         self._deferred_select_id = member.member_id
         self._deferred_activate = True
@@ -1977,23 +2329,37 @@ class AllianceMembersTab(QWidget):
     def _count_rank(self, rank: str) -> int:
         return sum(1 for member in self.members if member.rank == rank)
 
+    def _can_assign_rank(self, rank: str, member: Optional[MemberData]) -> bool:
+        current_rank = member.rank if member is not None else None
+        if rank == "R5":
+            count = self._count_rank("R5")
+            if current_rank == "R5":
+                count -= 1
+            if count >= 1:
+                QMessageBox.information(
+                    self,
+                    "Rank limit",
+                    "Only one member may hold rank R5 at a time.",
+                )
+                return False
+        if rank == "R4":
+            count = self._count_rank("R4")
+            if current_rank == "R4":
+                count -= 1
+            if count >= 10:
+                QMessageBox.information(
+                    self,
+                    "Rank limit",
+                    "Only ten members may hold rank R4 at a time.",
+                )
+                return False
+        return True
+
     def _set_member_rank(self, member: MemberData, rank: str):
         if member.rank == rank:
             return
-        if rank == "R5":
-            count = self._count_rank("R5")
-            if member.rank == "R5":
-                count -= 1
-            if count >= 1:
-                QMessageBox.information(self, "Rank limit", "Only one member may hold rank R5 at a time.")
-                return
-        if rank == "R4":
-            count = self._count_rank("R4")
-            if member.rank == "R4":
-                count -= 1
-            if count >= 10:
-                QMessageBox.information(self, "Rank limit", "Only ten members may hold rank R4 at a time.")
-                return
+        if not self._can_assign_rank(rank, member):
+            return
         member.rank = rank
         self._update_member_map_object(member)
         window = self.window()
@@ -2833,6 +3199,8 @@ class MainWindow(QMainWindow):
                 snapped_y = round(top_left.y() / v) * v
                 clamped = self.scene._clamp_top_left(snapped_x, snapped_y, w, h)
                 item.setPos(clamped)
+                item._update_handles_geometry()
+                item._update_handle_colors()
             elif isinstance(item, PreviewObject):
                 item.update_for_cell_size(v)
         self.scene.update()
