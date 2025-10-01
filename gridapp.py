@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import math
 import sys
+import uuid
 from dataclasses import dataclass, field
-from typing import Iterable, Optional
+from typing import Dict, Iterable, List, Optional, Set
 
 from PySide6.QtCore import (
     QEvent,
@@ -41,9 +42,27 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDockWidget,
+    QColorDialog,
     QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QSpinBox,
+    QTabWidget,
+    QToolBar,
+    QToolButton,
     QVBoxLayout,
+    QWidget,
     QGraphicsItem,
     QGraphicsItemGroup,
     QGraphicsRectItem,
@@ -51,21 +70,6 @@ from PySide6.QtWidgets import (
     QGraphicsSimpleTextItem,
     QGraphicsView,
     QInputDialog,
-    QColorDialog,
-    QDialog,
-    QDialogButtonBox,
-    QLabel,
-    QListWidget,
-    QListWidgetItem,
-    QMainWindow,
-    QMessageBox,
-    QMenu,
-    QPushButton,
-    QSpinBox,
-    QTabWidget,
-    QToolBar,
-    QToolButton,
-    QWidget,
 )
 
 
@@ -85,6 +89,7 @@ class ObjectSpec:
     fill: QColor = field(default_factory=lambda: QColor(Qt.lightGray))
     limit: Optional[int] = None
     limit_key: Optional[str] = None
+    template_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     def __post_init__(self):
         if self.limit_key is None:
@@ -100,6 +105,64 @@ class ZoneSpec:
     edge: QColor = field(default_factory=lambda: QColor(Qt.red))
 
 
+RANK_ORDER = ["R1", "R2", "R3", "R4", "R5"]
+RANK_COLORS: Dict[str, QColor] = {
+    "R1": QColor("#b0bec5"),
+    "R2": QColor("#90caf9"),
+    "R3": QColor("#a5d6a7"),
+    "R4": QColor("#ffe082"),
+    "R5": QColor("#f48fb1"),
+}
+
+
+@dataclass
+class MemberData:
+    name: str
+    member_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    rank: str = "R1"
+    roles: List[str] = field(default_factory=list)
+    map_object: Optional["MapObject"] = None
+    template_id: str = field(init=False)
+
+    def __post_init__(self):
+        self.template_id = f"member:{self.member_id}"
+
+    def display_text(self) -> str:
+        roles_text = ", ".join(self.roles)
+        if roles_text:
+            return f"{self.rank} {self.name} — {roles_text}"
+        return f"{self.rank} {self.name}"
+
+    def rank_color(self) -> QColor:
+        color = RANK_COLORS.get(self.rank)
+        return QColor(color) if color is not None else QColor(Qt.lightGray)
+
+    def placement_spec(self) -> ObjectSpec:
+        color = self.rank_color()
+        return ObjectSpec(
+            name=self.name,
+            size_w=3,
+            size_h=3,
+            fill=color,
+            limit=1,
+            limit_key=self.template_id,
+            template_id=self.template_id,
+        )
+
+
+@dataclass
+class RoleRecord:
+    name: str
+    role_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    member_id: Optional[str] = None
+    allowed_ranks: Optional[Set[str]] = None
+    standard: bool = False
+
+    def allows_rank(self, rank: str) -> bool:
+        if self.allowed_ranks is None:
+            return True
+        return rank in self.allowed_ranks
+
 DEFAULT_CATEGORIES: dict[str, list[ObjectSpec]] = {
     "Alliance": [
         ObjectSpec("R1", 3, 3, QColor(Qt.lightGray)),
@@ -109,7 +172,7 @@ DEFAULT_CATEGORIES: dict[str, list[ObjectSpec]] = {
         ObjectSpec("R5", 3, 3, QColor(Qt.lightGray), limit=1, limit_key="R5"),
         ObjectSpec("Base", 3, 3, QColor(Qt.lightGray)),
         ObjectSpec("MG", 3, 3, QColor(Qt.lightGray), limit=1, limit_key="MG"),
-        ObjectSpec("Furnace", 3, 3, QColor(Qt.lightGray), limit=1, limit_key="Furnace"),
+        ObjectSpec("Furnace", 4, 4, QColor(Qt.lightGray), limit=1, limit_key="Furnace"),
     ]
 }
 
@@ -126,6 +189,7 @@ def clone_spec(spec: ObjectSpec) -> ObjectSpec:
         QColor(spec.fill),
         spec.limit,
         spec.limit_key,
+        spec.template_id,
     )
 
 
@@ -793,6 +857,8 @@ class MapScene(QGraphicsScene):
     zone_updated = Signal(object)
     zone_removed = Signal(object)
     zone_redraw_finished = Signal(object)
+    object_placed = Signal(object)
+    object_removed = Signal(object)
 
     def __init__(self, cells: int, cell_size: int, parent=None):
         super().__init__(parent)
@@ -929,6 +995,7 @@ class MapScene(QGraphicsScene):
         self.addItem(obj)
         obj.updateLabelLayout()
         obj._last_valid_pos = QPointF(obj.pos())
+        self.object_placed.emit(obj)
         return obj
 
     def _next_zone_name(self) -> str:
@@ -1114,6 +1181,8 @@ class MapScene(QGraphicsScene):
             self.zone_draw_preview.setBrush(QBrush(QColor(DEFAULT_ZONE_FILL)))
 
     def remove_map_item(self, item: QGraphicsItemGroup):
+        if isinstance(item, MapObject):
+            self.object_removed.emit(item)
         self.removeItem(item)
         if isinstance(item, MapZone):
             if item in self._zones:
@@ -1324,14 +1393,26 @@ class PaletteList(QListWidget):
 
     def _on_item_double_clicked(self, item: QListWidgetItem):
         spec: ObjectSpec = item.data(Qt.UserRole)
+        previous = {
+            "name": spec.name,
+            "fill": QColor(spec.fill),
+            "size_w": spec.size_w,
+            "size_h": spec.size_h,
+        }
+        changed = False
         # Edit default text
         new_name, ok = QInputDialog.getText(self, "Edit default name", "Name:", text=spec.name)
         if ok and new_name.strip():
-            spec.name = new_name.strip()
+            final_name = new_name.strip()
+            if final_name != spec.name:
+                spec.name = final_name
+                changed = True
         # Edit color
         color = QColorDialog.getColor(spec.fill, self, "Choose color")
         if color.isValid():
-            spec.fill = QColor(color)
+            if color != spec.fill:
+                spec.fill = QColor(color)
+                changed = True
         # Edit size
         width, ok_w = QInputDialog.getInt(
             self,
@@ -1352,13 +1433,17 @@ class PaletteList(QListWidget):
                 max=GRID_CELLS,
             )
         if ok_w and ok_h:
-            spec.size_w = width
-            spec.size_h = height
+            if spec.size_w != width or spec.size_h != height:
+                spec.size_w = width
+                spec.size_h = height
+                changed = True
         # Update list label/icon
         self._refresh_item_display(item, spec)
         # If this spec is active, refresh preview
         w = self.window()
         if isinstance(w, MainWindow):
+            if changed:
+                w.offer_apply_spec_changes(spec, previous)
             w.refresh_active_preview_if(spec)
 
 
@@ -1433,9 +1518,32 @@ class ZoneList(QListWidget):
 class AllianceMembersTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.roles_tab: Optional["AllianceRolesTab"] = None
+        self.members: List[MemberData] = []
+        self._selected_member_id: Optional[str] = None
+        self._deferred_select_id: Optional[str] = None
+        self._deferred_activate = False
+
         layout = QVBoxLayout(self)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Filter by rank:"))
+        self.filter_combo = QComboBox(self)
+        self.filter_combo.addItem("All")
+        for rank in RANK_ORDER:
+            self.filter_combo.addItem(rank)
+        filter_row.addWidget(self.filter_combo)
+        self.sort_checkbox = QCheckBox("Sort by rank", self)
+        filter_row.addWidget(self.sort_checkbox)
+        filter_row.addStretch(1)
+        layout.addLayout(filter_row)
+
         self.member_list = QListWidget(self)
+        self.member_list.setAlternatingRowColors(True)
         self.member_list.itemDoubleClicked.connect(self._rename_member)
+        self.member_list.itemClicked.connect(self._on_member_clicked)
+        self.member_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.member_list.customContextMenuRequested.connect(self._show_context_menu)
         layout.addWidget(self.member_list)
 
         controls = QHBoxLayout()
@@ -1448,6 +1556,57 @@ class AllianceMembersTab(QWidget):
 
         add_btn.clicked.connect(self._add_member)
         remove_btn.clicked.connect(self._remove_selected)
+        self.filter_combo.currentIndexChanged.connect(self._refresh_list)
+        self.sort_checkbox.stateChanged.connect(self._refresh_list)
+
+        self._refresh_list()
+
+    def _refresh_list(self, *args):
+        select_id = self._deferred_select_id
+        activate = self._deferred_activate
+        self._deferred_select_id = None
+        self._deferred_activate = False
+        previous_selected = select_id or self._selected_member_id
+        filter_rank = self.filter_combo.currentText() if self.filter_combo.count() else "All"
+        if filter_rank != "All":
+            filtered = [member for member in self.members if member.rank == filter_rank]
+        else:
+            filtered = list(self.members)
+        if self.sort_checkbox.isChecked():
+            filtered.sort(key=lambda m: (RANK_ORDER.index(m.rank), m.name.lower()))
+        self.member_list.blockSignals(True)
+        self.member_list.clear()
+        selected_item: Optional[QListWidgetItem] = None
+        for member in filtered:
+            item = QListWidgetItem(member.display_text())
+            item.setData(Qt.UserRole, member.member_id)
+            self.member_list.addItem(item)
+            if previous_selected and member.member_id == previous_selected:
+                selected_item = item
+        if selected_item is not None:
+            self.member_list.setCurrentItem(selected_item)
+            self._selected_member_id = selected_item.data(Qt.UserRole)
+        elif self.member_list.count() > 0:
+            self.member_list.setCurrentRow(0)
+            current_item = self.member_list.currentItem()
+            self._selected_member_id = (
+                current_item.data(Qt.UserRole) if current_item is not None else None
+            )
+        else:
+            self._selected_member_id = None
+        self.member_list.blockSignals(False)
+        if activate and self._selected_member_id is not None:
+            self._activate_member_by_id(self._selected_member_id)
+
+    def _activate_member_by_id(self, member_id: Optional[str]):
+        if member_id is None:
+            return
+        member = self.get_member(member_id)
+        if member is None:
+            return
+        window = self.window()
+        if isinstance(window, MainWindow):
+            window.activate_member(member)
 
     def _add_member(self):
         name, ok = QInputDialog.getText(self, "Add Member", "Member name:")
@@ -1456,29 +1615,285 @@ class AllianceMembersTab(QWidget):
         name = name.strip()
         if not name:
             return
-        self.member_list.addItem(name)
+        member = MemberData(name=name)
+        self.members.append(member)
+        self._deferred_select_id = member.member_id
+        self._deferred_activate = True
+        self._refresh_list()
+
+    def _remove_member_by_id(self, member_id: str):
+        member = self.get_member(member_id)
+        if member is None:
+            return
+        window = self.window()
+        if isinstance(window, MainWindow):
+            if getattr(window, "active_member", None) is member:
+                window.cancel_active_placement()
+            if member.map_object is not None:
+                window.scene.remove_map_item(member.map_object)
+        if self.roles_tab is not None:
+            self.roles_tab.handle_member_removed(member.member_id)
+        self.members = [m for m in self.members if m.member_id != member.member_id]
 
     def _remove_selected(self):
-        for item in self.member_list.selectedItems():
-            self.member_list.takeItem(self.member_list.row(item))
+        selected_ids = [item.data(Qt.UserRole) for item in self.member_list.selectedItems()]
+        for member_id in selected_ids:
+            if member_id:
+                self._remove_member_by_id(member_id)
+        self._refresh_list()
+
+    def _member_from_item(self, item: Optional[QListWidgetItem]) -> Optional[MemberData]:
+        if item is None:
+            return None
+        member_id = item.data(Qt.UserRole)
+        return self.get_member(member_id) if member_id else None
 
     def _rename_member(self, item: QListWidgetItem):
-        current = item.text()
-        name, ok = QInputDialog.getText(self, "Rename Member", "Member name:", text=current)
+        member = self._member_from_item(item)
+        if member is None:
+            return
+        name, ok = QInputDialog.getText(self, "Rename Member", "Member name:", text=member.name)
         if not ok:
             return
         name = name.strip()
-        if not name:
+        if not name or name == member.name:
             return
-        item.setText(name)
+        member.name = name
+        self._update_member_map_object(member)
+        if self.roles_tab is not None:
+            self.roles_tab.handle_member_renamed(member.member_id, member.name)
+        window = self.window()
+        if isinstance(window, MainWindow) and getattr(window, "active_member", None) is member:
+            self._deferred_activate = True
+        else:
+            self._deferred_activate = False
+        self._deferred_select_id = member.member_id
+        self._refresh_list()
+
+    def _on_member_clicked(self, item: QListWidgetItem):
+        member = self._member_from_item(item)
+        if member is None:
+            return
+        self._selected_member_id = member.member_id
+        self._activate_member_by_id(member.member_id)
+
+    def _show_context_menu(self, point):
+        item = self.member_list.itemAt(point)
+        member = self._member_from_item(item)
+        if member is None:
+            return
+        menu = QMenu(self)
+        actions = []
+        for rank in RANK_ORDER:
+            action = menu.addAction(rank)
+            action.setData(rank)
+            action.setCheckable(True)
+            action.setChecked(rank == member.rank)
+            actions.append(action)
+        chosen = menu.exec(self.member_list.mapToGlobal(point))
+        if chosen is None:
+            return
+        rank = chosen.data()
+        if rank:
+            self._set_member_rank(member, rank)
+
+    def _count_rank(self, rank: str) -> int:
+        return sum(1 for member in self.members if member.rank == rank)
+
+    def _set_member_rank(self, member: MemberData, rank: str):
+        if member.rank == rank:
+            return
+        if rank == "R5":
+            count = self._count_rank("R5")
+            if member.rank == "R5":
+                count -= 1
+            if count >= 1:
+                QMessageBox.information(self, "Rank limit", "Only one member may hold rank R5 at a time.")
+                return
+        if rank == "R4":
+            count = self._count_rank("R4")
+            if member.rank == "R4":
+                count -= 1
+            if count >= 10:
+                QMessageBox.information(self, "Rank limit", "Only ten members may hold rank R4 at a time.")
+                return
+        member.rank = rank
+        self._update_member_map_object(member)
+        window = self.window()
+        if isinstance(window, MainWindow) and getattr(window, "active_member", None) is member:
+            self._deferred_activate = True
+        else:
+            self._deferred_activate = False
+        if self.roles_tab is not None:
+            self.roles_tab.handle_member_rank_changed(member.member_id, rank)
+        self._deferred_select_id = member.member_id
+        self._refresh_list()
+
+    def _update_member_map_object(self, member: MemberData):
+        if member.map_object is None:
+            return
+        color = member.rank_color()
+        obj = member.map_object
+        obj.spec.name = member.name
+        obj.label_item.setText(member.name)
+        obj.updateLabelLayout()
+        obj.spec.fill = QColor(color)
+        obj.rect_item.setBrush(QBrush(obj.spec.fill))
+        obj._last_valid_pos = QPointF(obj.pos())
+
+    def get_member(self, member_id: Optional[str]) -> Optional[MemberData]:
+        if member_id is None:
+            return None
+        for member in self.members:
+            if member.member_id == member_id:
+                return member
+        return None
+
+    def find_member_by_template(self, template_id: str) -> Optional[MemberData]:
+        for member in self.members:
+            if member.template_id == template_id:
+                return member
+        return None
+
+    def handle_member_object_placed(self, template_id: str, obj: MapObject):
+        member = self.find_member_by_template(template_id)
+        if member is None:
+            return
+        member.map_object = obj
+        self._update_member_map_object(member)
+
+    def handle_member_object_removed(self, template_id: str):
+        member = self.find_member_by_template(template_id)
+        if member is None:
+            return
+        member.map_object = None
+
+    def assign_role(self, member_id: str, role_name: str):
+        member = self.get_member(member_id)
+        if member is None:
+            return
+        if role_name not in member.roles:
+            member.roles.append(role_name)
+            member.roles.sort(key=str.lower)
+            self._deferred_select_id = member.member_id
+            self._deferred_activate = False
+            self._refresh_list()
+
+    def unassign_role(self, member_id: str, role_name: str):
+        member = self.get_member(member_id)
+        if member is None:
+            return
+        if role_name in member.roles:
+            member.roles = [r for r in member.roles if r != role_name]
+            self._deferred_select_id = member.member_id
+            self._deferred_activate = False
+            self._refresh_list()
+
+    def rename_role(self, old_name: str, new_name: str):
+        changed = False
+        for member in self.members:
+            if old_name in member.roles:
+                member.roles = [new_name if r == old_name else r for r in member.roles]
+                member.roles.sort(key=str.lower)
+                changed = True
+        if changed:
+            self._refresh_list()
+
+    def remove_role_name(self, role_name: str):
+        changed = False
+        for member in self.members:
+            if role_name in member.roles:
+                member.roles = [r for r in member.roles if r != role_name]
+                changed = True
+        if changed:
+            self._refresh_list()
+
+    def eligible_members(self, allowed_ranks: Optional[Set[str]]) -> List[MemberData]:
+        if allowed_ranks is None:
+            return list(self.members)
+        return [member for member in self.members if member.rank in allowed_ranks]
+
+
+class RoleConfigDialog(QDialog):
+    def __init__(self, parent=None, role_name: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Add Role")
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Role title:"))
+        self.name_edit = QLineEdit(self)
+        self.name_edit.setText(role_name)
+        layout.addWidget(self.name_edit)
+        layout.addWidget(QLabel("Allow assignment to ranks:"))
+        ranks_layout = QHBoxLayout()
+        self.rank_checks: Dict[str, QCheckBox] = {}
+        for rank in RANK_ORDER:
+            cb = QCheckBox(rank, self)
+            cb.setChecked(True)
+            self.rank_checks[rank] = cb
+            ranks_layout.addWidget(cb)
+        ranks_layout.addStretch(1)
+        layout.addLayout(ranks_layout)
+        note = QLabel("Uncheck ranks to restrict who can hold this role.", self)
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def role_name(self) -> str:
+        return self.name_edit.text().strip()
+
+    def selected_ranks(self) -> Set[str]:
+        return {rank for rank, cb in self.rank_checks.items() if cb.isChecked()}
+
+
+class RoleAssignmentDialog(QDialog):
+    def __init__(
+        self,
+        role_name: str,
+        members: List[MemberData],
+        current_member_id: Optional[str] = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(f"Assign {role_name}")
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Select a member for this role:"))
+        self.list_widget = QListWidget(self)
+        vacancy_item = QListWidgetItem("Vacant")
+        vacancy_item.setData(Qt.UserRole, None)
+        self.list_widget.addItem(vacancy_item)
+        default_row = 0
+        for member in members:
+            item = QListWidgetItem(f"{member.rank} {member.name}")
+            item.setData(Qt.UserRole, member.member_id)
+            self.list_widget.addItem(item)
+            if current_member_id and member.member_id == current_member_id:
+                default_row = self.list_widget.count() - 1
+        self.list_widget.setCurrentRow(default_row)
+        self.list_widget.itemDoubleClicked.connect(lambda *_: self.accept())
+        layout.addWidget(self.list_widget)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_member_id(self) -> Optional[str]:
+        item = self.list_widget.currentItem()
+        return item.data(Qt.UserRole) if item is not None else None
 
 
 class AllianceRolesTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.members_tab: Optional[AllianceMembersTab] = None
+        self.roles: List[RoleRecord] = []
+        self._selected_role_id: Optional[str] = None
+
         layout = QVBoxLayout(self)
         self.role_list = QListWidget(self)
-        self.role_list.itemDoubleClicked.connect(self._assign_member)
+        self.role_list.itemDoubleClicked.connect(self._on_item_double_clicked)
         layout.addWidget(self.role_list)
 
         controls = QHBoxLayout()
@@ -1498,80 +1913,185 @@ class AllianceRolesTab(QWidget):
         remove_btn.clicked.connect(self._remove_selected)
         assign_btn.clicked.connect(self._prompt_assign_member)
 
-        for role in ["Warlord", "Recruiter", "Muse", "Butler"]:
-            self._add_role(role)
+        for role_name in ["Warlord", "Recruiter", "Muse", "Butler"]:
+            self._add_role_record(
+                RoleRecord(role_name, allowed_ranks={"R4"}, standard=True)
+            )
 
-    def _role_data(self, role: str, member: Optional[str] = None) -> dict:
-        return {"role": role, "member": member}
+    def _on_item_double_clicked(self, item: QListWidgetItem):
+        role = self._role_from_item(item)
+        if role is not None:
+            self._assign_role(role)
 
-    def _update_item_text(self, item: QListWidgetItem):
-        data = item.data(Qt.UserRole) or {}
-        role = data.get("role", "Role")
-        member = data.get("member")
-        if member:
-            item.setText(f"{role} — {member}")
+    def _role_from_item(self, item: Optional[QListWidgetItem]) -> Optional[RoleRecord]:
+        if item is None:
+            return None
+        role_id = item.data(Qt.UserRole)
+        return self.get_role(role_id)
+
+    def get_role(self, role_id: Optional[str]) -> Optional[RoleRecord]:
+        if role_id is None:
+            return None
+        for record in self.roles:
+            if record.role_id == role_id:
+                return record
+        return None
+
+    def _refresh_roles(self, select_id: Optional[str] = None):
+        previous = select_id or self._selected_role_id
+        self.role_list.blockSignals(True)
+        self.role_list.clear()
+        selected_item = None
+        for record in self.roles:
+            item = QListWidgetItem(self._role_text(record))
+            item.setData(Qt.UserRole, record.role_id)
+            self.role_list.addItem(item)
+            if previous and record.role_id == previous:
+                selected_item = item
+        if selected_item is not None:
+            self.role_list.setCurrentItem(selected_item)
+            self._selected_role_id = selected_item.data(Qt.UserRole)
+        elif self.role_list.count() > 0:
+            self.role_list.setCurrentRow(0)
+            current_item = self.role_list.currentItem()
+            self._selected_role_id = (
+                current_item.data(Qt.UserRole) if current_item is not None else None
+            )
         else:
-            item.setText(f"{role} (vacant)")
+            self._selected_role_id = None
+        self.role_list.blockSignals(False)
 
-    def _add_role(self, role: str, member: Optional[str] = None):
-        item = QListWidgetItem()
-        item.setData(Qt.UserRole, self._role_data(role, member))
-        self._update_item_text(item)
-        self.role_list.addItem(item)
+    def _role_text(self, record: RoleRecord) -> str:
+        member_name = ""
+        if record.member_id and self.members_tab is not None:
+            member = self.members_tab.get_member(record.member_id)
+            if member is not None:
+                member_name = member.name
+        if member_name:
+            return f"{record.name} — {member_name}"
+        return f"{record.name} (vacant)"
+
+    def _add_role_record(self, record: RoleRecord):
+        self.roles.append(record)
+        self._refresh_roles(select_id=record.role_id)
 
     def _prompt_add_role(self):
-        role, ok = QInputDialog.getText(self, "Add Role", "Role title:")
-        if not ok:
+        dialog = RoleConfigDialog(self)
+        if dialog.exec() != QDialog.Accepted:
             return
-        role = role.strip()
-        if not role:
+        name = dialog.role_name()
+        if not name:
             return
-        self._add_role(role)
+        selected_ranks = dialog.selected_ranks()
+        if not selected_ranks or len(selected_ranks) == len(RANK_ORDER):
+            allowed = None
+        else:
+            allowed = set(selected_ranks)
+        record = RoleRecord(name, allowed_ranks=allowed)
+        self._add_role_record(record)
 
-    def _selected_role_item(self) -> Optional[QListWidgetItem]:
-        return self.role_list.currentItem()
+    def _current_role(self) -> Optional[RoleRecord]:
+        return self.get_role(self._selected_role_id)
 
     def _rename_role(self):
-        item = self._selected_role_item()
-        if item is None:
+        record = self._current_role()
+        if record is None:
             return
-        data = item.data(Qt.UserRole) or {}
-        role = data.get("role", item.text())
-        new_role, ok = QInputDialog.getText(self, "Rename Role", "Role title:", text=role)
+        new_name, ok = QInputDialog.getText(self, "Rename Role", "Role title:", text=record.name)
         if not ok:
             return
-        new_role = new_role.strip()
-        if not new_role:
+        new_name = new_name.strip()
+        if not new_name or new_name == record.name:
             return
-        data["role"] = new_role
-        item.setData(Qt.UserRole, data)
-        self._update_item_text(item)
+        old_name = record.name
+        record.name = new_name
+        if self.members_tab is not None:
+            self.members_tab.rename_role(old_name, new_name)
+        self._refresh_roles(select_id=record.role_id)
 
     def _remove_selected(self):
-        for item in self.role_list.selectedItems():
-            self.role_list.takeItem(self.role_list.row(item))
-
-    def _assign_member(self, item: QListWidgetItem):
-        data = item.data(Qt.UserRole) or {}
-        role = data.get("role", item.text())
-        member, ok = QInputDialog.getText(
-            self,
-            "Assign Member",
-            f"Assign member to {role} (leave blank for vacant):",
-            text=data.get("member") or "",
-        )
-        if not ok:
-            return
-        member = member.strip()
-        data["member"] = member or None
-        item.setData(Qt.UserRole, data)
-        self._update_item_text(item)
+        selected_ids = [item.data(Qt.UserRole) for item in self.role_list.selectedItems()]
+        updated = False
+        for role_id in selected_ids:
+            record = self.get_role(role_id)
+            if record is None:
+                continue
+            if record.member_id and self.members_tab is not None:
+                self.members_tab.unassign_role(record.member_id, record.name)
+            if self.members_tab is not None:
+                self.members_tab.remove_role_name(record.name)
+            self.roles = [r for r in self.roles if r.role_id != role_id]
+            updated = True
+        if updated:
+            self._refresh_roles()
 
     def _prompt_assign_member(self):
-        item = self._selected_role_item()
-        if item is None:
+        record = self._current_role()
+        if record is None:
             return
-        self._assign_member(item)
+        self._assign_role(record)
+
+    def _assign_role(self, record: RoleRecord):
+        if self.members_tab is None:
+            return
+        eligible = self.members_tab.eligible_members(record.allowed_ranks)
+        if not eligible and record.member_id is None:
+            QMessageBox.information(
+                self,
+                "No eligible members",
+                "No members meet the rank requirements for this role.",
+            )
+            return
+        dialog = RoleAssignmentDialog(
+            record.name,
+            eligible,
+            current_member_id=record.member_id,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        selected_member_id = dialog.selected_member_id()
+        if selected_member_id == record.member_id:
+            return
+        if record.member_id and self.members_tab is not None:
+            self.members_tab.unassign_role(record.member_id, record.name)
+        record.member_id = selected_member_id
+        if selected_member_id and self.members_tab is not None:
+            self.members_tab.assign_role(selected_member_id, record.name)
+        self._refresh_roles(select_id=record.role_id)
+
+    def handle_member_removed(self, member_id: str):
+        updated = False
+        for record in self.roles:
+            if record.member_id == member_id:
+                record.member_id = None
+                updated = True
+        if updated:
+            self._refresh_roles()
+
+    def handle_member_renamed(self, member_id: str, new_name: str):
+        if any(record.member_id == member_id for record in self.roles):
+            self._refresh_roles()
+
+    def handle_member_rank_changed(self, member_id: str, new_rank: str):
+        if self.members_tab is None:
+            return
+        removed_roles: List[str] = []
+        for record in self.roles:
+            if record.member_id == member_id and not record.allows_rank(new_rank):
+                if record.member_id and self.members_tab is not None:
+                    self.members_tab.unassign_role(record.member_id, record.name)
+                record.member_id = None
+                removed_roles.append(record.name)
+        if removed_roles:
+            member = self.members_tab.get_member(member_id)
+            if member is not None:
+                QMessageBox.information(
+                    self,
+                    "Role unassigned",
+                    f"{member.name} no longer meets the rank requirements for: {', '.join(removed_roles)}.",
+                )
+            self._refresh_roles()
 
 
 class AllianceWidget(QTabWidget):
@@ -1579,6 +2099,9 @@ class AllianceWidget(QTabWidget):
         super().__init__(parent)
         self.members_tab = AllianceMembersTab(self)
         self.roles_tab = AllianceRolesTab(self)
+        self.members_tab.roles_tab = self.roles_tab
+        self.roles_tab.members_tab = self.members_tab
+        self.roles_tab._refresh_roles()
         self.addTab(self.members_tab, "Members")
         self.addTab(self.roles_tab, "Roles")
 
@@ -1716,6 +2239,8 @@ class MainWindow(QMainWindow):
         self.scene = MapScene(GRID_CELLS, CELL_SIZE, self)
         self.view = MapView(self.scene, self)
         self.setCentralWidget(self.view)
+        self.active_member: Optional[MemberData] = None
+        self._active_member_spec: Optional[ObjectSpec] = None
 
         # Sidebar (dock)
         self.palette_tabs = PaletteTabWidget(self)
@@ -1784,12 +2309,26 @@ class MainWindow(QMainWindow):
         self.scene.zone_updated.connect(self.zone_list.update_zone_item)
         self.scene.zone_removed.connect(self.zone_list.remove_zone)
         self.scene.zone_redraw_finished.connect(self._on_zone_redraw_finished)
+        self.scene.object_placed.connect(self._on_object_placed)
+        self.scene.object_removed.connect(self._on_object_removed)
 
-    def activate_placement(self, spec: ObjectSpec):
+    def activate_placement(self, spec: ObjectSpec, clear_member: bool = True):
+        if clear_member:
+            self.active_member = None
+            self._active_member_spec = None
         self.set_zone_draw_mode(False)
         self.scene.set_active_spec(spec)
         self.hint_label.setText(
             f"Placing {spec.name}: Left-click to place, Shift+Click for multiple, Right-click to cancel"
+        )
+
+    def activate_member(self, member: MemberData):
+        spec = member.placement_spec()
+        self._active_member_spec = spec
+        self.activate_placement(spec, clear_member=False)
+        self.active_member = member
+        self.hint_label.setText(
+            f"Placing {member.name} ({member.rank}): Left-click to place, Right-click to cancel"
         )
 
     def set_zone_draw_mode(self, enabled: bool):
@@ -1838,6 +2377,71 @@ class MainWindow(QMainWindow):
         if self.scene.active_spec is spec:
             self.scene.set_active_spec(spec)
 
+    def _on_object_placed(self, obj: MapObject):
+        template_id = getattr(obj.spec, "template_id", "")
+        if template_id and template_id.startswith("member:"):
+            self.alliance_widget.members_tab.handle_member_object_placed(template_id, obj)
+
+    def _on_object_removed(self, obj: MapObject):
+        template_id = getattr(obj.spec, "template_id", "")
+        if template_id and template_id.startswith("member:"):
+            self.alliance_widget.members_tab.handle_member_object_removed(template_id)
+
+    def offer_apply_spec_changes(self, spec: ObjectSpec, previous: dict):
+        matching: list[MapObject] = []
+        for item in self.scene.items():
+            if isinstance(item, MapObject) and item.spec.template_id == spec.template_id:
+                matching.append(item)
+        if not matching:
+            return
+        response = QMessageBox.question(
+            self,
+            "Update placed objects",
+            "Apply these changes to existing objects of the same type?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if response != QMessageBox.Yes:
+            return
+        size_changed = (
+            previous.get("size_w") != spec.size_w or previous.get("size_h") != spec.size_h
+        )
+        failed = False
+        for obj in matching:
+            obj.spec.name = spec.name
+            obj.label_item.setText(spec.name)
+            obj.updateLabelLayout()
+            obj.spec.fill = QColor(spec.fill)
+            obj.rect_item.setBrush(QBrush(obj.spec.fill))
+            if size_changed:
+                old_w = obj.spec.size_w
+                old_h = obj.spec.size_h
+                obj.spec.size_w = spec.size_w
+                obj.spec.size_h = spec.size_h
+                w_px = spec.size_w * self.scene.cell_size
+                h_px = spec.size_h * self.scene.cell_size
+                obj.rect_item.setRect(0, 0, w_px, h_px)
+                obj.updateLabelLayout()
+                self.scene.snap_items_to_grid([obj])
+                if not self.scene.is_object_position_free(obj):
+                    obj.spec.size_w = old_w
+                    obj.spec.size_h = old_h
+                    obj.rect_item.setRect(0, 0, old_w * self.scene.cell_size, old_h * self.scene.cell_size)
+                    obj.updateLabelLayout()
+                    self.scene.snap_items_to_grid([obj])
+                    failed = True
+                else:
+                    obj._last_valid_pos = QPointF(obj.pos())
+            else:
+                obj._last_valid_pos = QPointF(obj.pos())
+        if failed:
+            QMessageBox.information(
+                self,
+                "Resize blocked",
+                "Some objects could not be resized because they would overlap other items.",
+            )
+        self.scene.update()
+
     def clear_placement_hint(self):
         self.hint_label.setText("")
 
@@ -1846,6 +2450,8 @@ class MainWindow(QMainWindow):
         if self.scene.active_spec is not None:
             self.scene.cancel_placement()
             any_cancelled = True
+        self.active_member = None
+        self._active_member_spec = None
         if self.scene.zone_draw_mode:
             self.set_zone_draw_mode(False)
             any_cancelled = True
