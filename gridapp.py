@@ -36,11 +36,14 @@ from PySide6.QtGui import (
     QPainter,
     QPen,
     QColor,
+    QIcon,
+    QPixmap,
 )
 from PySide6.QtWidgets import (
     QApplication,
     QDockWidget,
     QHBoxLayout,
+    QVBoxLayout,
     QGraphicsItem,
     QGraphicsItemGroup,
     QGraphicsRectItem,
@@ -49,12 +52,15 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QInputDialog,
     QColorDialog,
+    QDialog,
+    QDialogButtonBox,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QMenu,
+    QPushButton,
     QSpinBox,
     QTabWidget,
     QToolBar,
@@ -77,6 +83,12 @@ class ObjectSpec:
     size_w: int = 1  # width in cells
     size_h: int = 1  # height in cells
     fill: QColor = field(default_factory=lambda: QColor(Qt.lightGray))
+    limit: Optional[int] = None
+    limit_key: Optional[str] = None
+
+    def __post_init__(self):
+        if self.limit_key is None:
+            self.limit_key = self.name
 
 
 @dataclass
@@ -93,9 +105,11 @@ DEFAULT_CATEGORIES: dict[str, list[ObjectSpec]] = {
         ObjectSpec("R1", 3, 3, QColor(Qt.lightGray)),
         ObjectSpec("R2", 3, 3, QColor(Qt.lightGray)),
         ObjectSpec("R3", 3, 3, QColor(Qt.lightGray)),
-        ObjectSpec("R4", 3, 3, QColor(Qt.lightGray)),
-        ObjectSpec("R5", 3, 3, QColor(Qt.lightGray)),
+        ObjectSpec("R4", 3, 3, QColor(Qt.lightGray), limit=10, limit_key="R4"),
+        ObjectSpec("R5", 3, 3, QColor(Qt.lightGray), limit=1, limit_key="R5"),
         ObjectSpec("Base", 3, 3, QColor(Qt.lightGray)),
+        ObjectSpec("MG", 3, 3, QColor(Qt.lightGray), limit=1, limit_key="MG"),
+        ObjectSpec("Furnace", 3, 3, QColor(Qt.lightGray), limit=1, limit_key="Furnace"),
     ]
 }
 
@@ -105,7 +119,43 @@ DEFAULT_ZONE_EDGE = QColor(Qt.red)
 
 
 def clone_spec(spec: ObjectSpec) -> ObjectSpec:
-    return ObjectSpec(spec.name, spec.size_w, spec.size_h, QColor(spec.fill))
+    return ObjectSpec(
+        spec.name,
+        spec.size_w,
+        spec.size_h,
+        QColor(spec.fill),
+        spec.limit,
+        spec.limit_key,
+    )
+
+
+# ----------------------------- UI Helpers ------------------------------
+def create_color_icon(color: QColor, size: int = 16) -> QIcon:
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.setBrush(QBrush(color))
+    pen = QPen(Qt.black)
+    pen.setWidth(1)
+    painter.setPen(pen)
+    painter.drawRect(0, 0, size - 1, size - 1)
+    painter.end()
+    return QIcon(pixmap)
+
+
+def create_zone_icon(fill: QColor, edge: QColor, size: int = 16) -> QIcon:
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.setBrush(QBrush(fill))
+    pen = QPen(edge)
+    pen.setWidth(2)
+    painter.setPen(pen)
+    painter.drawRect(1, 1, size - 3, size - 3)
+    painter.end()
+    return QIcon(pixmap)
 
 
 # ----------------------------- Map Items -------------------------------
@@ -333,6 +383,80 @@ class PreviewObject(QGraphicsItemGroup):
         self.label_item.setPos((w - label_rect.width()) / 2, (h - label_rect.height()) / 2)
 
 
+class ZoneCoordinateDialog(QDialog):
+    def __init__(
+        self,
+        max_cells: int,
+        bottom_left: tuple[int, int],
+        top_right: tuple[int, int],
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Set Zone Coordinates")
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(
+            QLabel(
+                "Enter cell coordinates (0-based) using a bottom-left origin for Y."
+            )
+        )
+
+        self.bottom_left_x = QSpinBox(self)
+        self.bottom_left_x.setRange(0, max_cells - 1)
+        self.bottom_left_x.setValue(bottom_left[0])
+
+        self.bottom_left_y = QSpinBox(self)
+        self.bottom_left_y.setRange(0, max_cells - 1)
+        self.bottom_left_y.setValue(bottom_left[1])
+
+        self.top_right_x = QSpinBox(self)
+        self.top_right_x.setRange(0, max_cells - 1)
+        self.top_right_x.setValue(top_right[0])
+
+        self.top_right_y = QSpinBox(self)
+        self.top_right_y.setRange(0, max_cells - 1)
+        self.top_right_y.setValue(top_right[1])
+
+        self.top_right_x.setMinimum(bottom_left[0])
+        self.top_right_y.setMinimum(bottom_left[1])
+
+        self.bottom_left_x.valueChanged.connect(self.top_right_x.setMinimum)
+        self.bottom_left_y.valueChanged.connect(self.top_right_y.setMinimum)
+
+        bl_row = QHBoxLayout()
+        bl_row.addWidget(QLabel("Bottom-left X:"))
+        bl_row.addWidget(self.bottom_left_x)
+        layout.addLayout(bl_row)
+
+        bl_y_row = QHBoxLayout()
+        bl_y_row.addWidget(QLabel("Bottom-left Y:"))
+        bl_y_row.addWidget(self.bottom_left_y)
+        layout.addLayout(bl_y_row)
+
+        tr_row = QHBoxLayout()
+        tr_row.addWidget(QLabel("Top-right X:"))
+        tr_row.addWidget(self.top_right_x)
+        layout.addLayout(tr_row)
+
+        tr_y_row = QHBoxLayout()
+        tr_y_row.addWidget(QLabel("Top-right Y:"))
+        tr_y_row.addWidget(self.top_right_y)
+        layout.addLayout(tr_y_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_coordinates(self) -> tuple[int, int, int, int]:
+        return (
+            self.bottom_left_x.value(),
+            self.bottom_left_y.value(),
+            self.top_right_x.value(),
+            self.top_right_y.value(),
+        )
+
+
 class MapZone(QGraphicsItemGroup):
     def __init__(self, spec: ZoneSpec, top_left: QPointF, cell_size: int):
         super().__init__()
@@ -482,49 +606,49 @@ class MapZone(QGraphicsItemGroup):
         y_cells = int(round(current_top_left.y() / cs))
         width_cells = self.spec.size_w
         height_cells = self.spec.size_h
+        bottom_left_x = x_cells
+        # Convert top-origin y to bottom-origin coordinates
+        max_index = max_cells - 1
+        bottom_left_y = max_index - (y_cells + height_cells - 1)
+        top_right_x = bottom_left_x + width_cells - 1
+        top_right_y = bottom_left_y + height_cells - 1
 
-        x, ok_x = QInputDialog.getInt(
-            None,
-            "Zone X",
-            "Top-left X (cells):",
-            value=x_cells,
-            min=0,
-            max=max_cells - 1,
-        )
-        if not ok_x:
-            return False
-        y, ok_y = QInputDialog.getInt(
-            None,
-            "Zone Y",
-            "Top-left Y (cells):",
-            value=y_cells,
-            min=0,
-            max=max_cells - 1,
-        )
-        if not ok_y:
-            return False
-        width, ok_w = QInputDialog.getInt(
-            None,
-            "Zone Width",
-            "Width (cells):",
-            value=width_cells,
-            min=1,
-            max=max_cells,
-        )
-        if not ok_w:
-            return False
-        height, ok_h = QInputDialog.getInt(
-            None,
-            "Zone Height",
-            "Height (cells):",
-            value=height_cells,
-            min=1,
-            max=max_cells,
-        )
-        if not ok_h:
+        bottom_left = (bottom_left_x, bottom_left_y)
+        top_right = (top_right_x, top_right_y)
+
+        dialog = ZoneCoordinateDialog(max_cells, bottom_left, top_right)
+        if dialog.exec() != QDialog.Accepted:
             return False
 
-        if x + width > max_cells or y + height > max_cells:
+        x_bl, y_bl, x_tr, y_tr = dialog.get_coordinates()
+        if x_tr < x_bl or y_tr < y_bl:
+            QMessageBox.warning(
+                None,
+                "Invalid coordinates",
+                "Top-right coordinates must be greater than or equal to bottom-left.",
+            )
+            return False
+
+        if not (0 <= x_tr < max_cells and 0 <= y_tr < max_cells):
+            QMessageBox.warning(
+                None,
+                "Coordinates out of bounds",
+                "The specified zone extends beyond the map bounds.",
+            )
+            return False
+
+        width = (x_tr - x_bl) + 1
+        height = (y_tr - y_bl) + 1
+        if width <= 0 or height <= 0:
+            QMessageBox.warning(
+                None,
+                "Invalid size",
+                "Zone must be at least 1x1 cell.",
+            )
+            return False
+
+        top_left_y_cells = max_cells - y_tr - 1
+        if top_left_y_cells < 0:
             QMessageBox.warning(
                 None,
                 "Coordinates out of bounds",
@@ -543,7 +667,7 @@ class MapZone(QGraphicsItemGroup):
         self.rect_item.setRect(0, 0, w, h)
         self.updateLabelLayout()
 
-        new_pos = QPointF(x * cs, y * cs)
+        new_pos = QPointF(x_bl * cs, top_left_y_cells * cs)
         if isinstance(scene, MapScene):
             clamped = scene._clamp_top_left(new_pos.x(), new_pos.y(), w, h)
             self.setPos(clamped)
@@ -694,6 +818,7 @@ class MapScene(QGraphicsScene):
         self._zone_counter = 0
         self._zones: list[MapZone] = []
         self._zone_redraw_target: Optional[MapZone] = None
+        self._zone_redraw_hidden_target = False
 
     # --- Helpers ---
     def scene_width(self) -> float:
@@ -749,6 +874,15 @@ class MapScene(QGraphicsScene):
         rect = obj.bounding_rect_scene()
         return self.is_area_free_for_object(rect, obj)
 
+    def count_objects_with_key(self, key: Optional[str]) -> int:
+        if not key:
+            return 0
+        count = 0
+        for item in self.items():
+            if isinstance(item, MapObject) and item.spec.limit_key == key:
+                count += 1
+        return count
+
     # --- Placement tool API ---
     def set_active_spec(self, spec: Optional[ObjectSpec]):
         if self.preview_item is not None:
@@ -771,6 +905,16 @@ class MapScene(QGraphicsScene):
     def place_active_at(self, scene_pos: QPointF) -> Optional[QGraphicsItemGroup]:
         if self.active_spec is None:
             return None
+        if self.active_spec.limit is not None:
+            limit_key = self.active_spec.limit_key or self.active_spec.name
+            existing = self.count_objects_with_key(limit_key)
+            if existing >= self.active_spec.limit:
+                QMessageBox.information(
+                    None,
+                    "Limit reached",
+                    f"Cannot place more than {self.active_spec.limit} instance(s) of {limit_key}.",
+                )
+                return None
         pos = self._top_left_from_center_snap(scene_pos)
         rect = QRectF(
             pos.x(),
@@ -798,6 +942,7 @@ class MapScene(QGraphicsScene):
             self.zone_draw_preview.setVisible(False)
         if self.zone_hover_indicator is not None:
             self.zone_hover_indicator.setVisible(True)
+        self._zone_redraw_hidden_target = False
 
     def set_zone_draw_mode(self, enabled: bool):
         if self.zone_draw_mode == enabled:
@@ -827,6 +972,9 @@ class MapScene(QGraphicsScene):
     def begin_zone_draw(self, start: QPointF):
         if not self.zone_draw_mode:
             return
+        if self._zone_redraw_target is not None and not self._zone_redraw_hidden_target:
+            self._zone_redraw_target.setVisible(False)
+            self._zone_redraw_hidden_target = True
         self.zone_draw_start = start
         if self.zone_hover_indicator is not None:
             self.zone_hover_indicator.setVisible(False)
@@ -867,6 +1015,9 @@ class MapScene(QGraphicsScene):
 
         self.update_zone_hover(end)
         if start == end:
+            if self._zone_redraw_target is not None and self._zone_redraw_hidden_target:
+                self._zone_redraw_target.setVisible(True)
+                self._zone_redraw_hidden_target = False
             return None
 
         rect = QRectF(start, end).normalized()
@@ -874,6 +1025,9 @@ class MapScene(QGraphicsScene):
         width_cells = int(round(rect.width() / cs))
         height_cells = int(round(rect.height() / cs))
         if width_cells == 0 or height_cells == 0:
+            if self._zone_redraw_target is not None and self._zone_redraw_hidden_target:
+                self._zone_redraw_target.setVisible(True)
+                self._zone_redraw_hidden_target = False
             return None
 
         top_left = QPointF(rect.left(), rect.top())
@@ -888,9 +1042,11 @@ class MapScene(QGraphicsScene):
             zone.updateLabelLayout()
             clamped = self._clamp_top_left(top_left.x(), top_left.y(), w, h)
             zone.setPos(clamped)
+            zone.setVisible(True)
             self.zone_updated.emit(zone)
             self.zone_redraw_finished.emit(zone)
             self._zone_redraw_target = None
+            self._zone_redraw_hidden_target = False
             return zone
 
         spec = ZoneSpec(
@@ -915,6 +1071,9 @@ class MapScene(QGraphicsScene):
             self.show_zone_hover()
         else:
             self.hide_zone_hover()
+        if self._zone_redraw_target is not None and self._zone_redraw_hidden_target:
+            self._zone_redraw_target.setVisible(True)
+        self._zone_redraw_hidden_target = False
         self._zone_redraw_target = None
 
     def update_zone_hover(self, scene_pos: QPointF):
@@ -1142,9 +1301,20 @@ class PaletteList(QListWidget):
     def populate(self):
         self.clear()
         for spec in self.specs:
-            item = QListWidgetItem(f"{spec.name}  ({spec.size_w}x{spec.size_h})")
+            item = QListWidgetItem(self._item_label(spec))
             item.setData(Qt.UserRole, spec)
+            item.setIcon(create_color_icon(spec.fill))
             self.addItem(item)
+
+    def _item_label(self, spec: ObjectSpec) -> str:
+        label = f"{spec.name}  ({spec.size_w}x{spec.size_h})"
+        if spec.limit is not None:
+            label += f"  [max {spec.limit}]"
+        return label
+
+    def _refresh_item_display(self, item: QListWidgetItem, spec: ObjectSpec) -> None:
+        item.setText(self._item_label(spec))
+        item.setIcon(create_color_icon(spec.fill))
 
     def _on_item_clicked(self, item: QListWidgetItem):
         spec: ObjectSpec = item.data(Qt.UserRole)
@@ -1184,8 +1354,8 @@ class PaletteList(QListWidget):
         if ok_w and ok_h:
             spec.size_w = width
             spec.size_h = height
-        # Update list label
-        item.setText(f"{spec.name}  ({spec.size_w}x{spec.size_h})")
+        # Update list label/icon
+        self._refresh_item_display(item, spec)
         # If this spec is active, refresh preview
         w = self.window()
         if isinstance(w, MainWindow):
@@ -1202,9 +1372,17 @@ class ZoneList(QListWidget):
     def _zone_label(self, zone: MapZone) -> str:
         return f"{zone.spec.name}  ({zone.spec.size_w}x{zone.spec.size_h})"
 
+    def _zone_icon(self, zone: MapZone) -> QIcon:
+        return create_zone_icon(zone.spec.fill, zone.spec.edge)
+
+    def _refresh_item(self, item: QListWidgetItem, zone: MapZone):
+        item.setText(self._zone_label(zone))
+        item.setIcon(self._zone_icon(zone))
+
     def add_zone(self, zone: MapZone):
         item = QListWidgetItem(self._zone_label(zone))
         item.setData(Qt.UserRole, zone)
+        item.setIcon(self._zone_icon(zone))
         self.addItem(item)
 
     def remove_zone(self, zone: MapZone):
@@ -1222,7 +1400,7 @@ class ZoneList(QListWidget):
             if item is None:
                 continue
             if item.data(Qt.UserRole) is zone:
-                item.setText(self._zone_label(zone))
+                self._refresh_item(item, zone)
                 break
 
     def _on_item_clicked(self, item: QListWidgetItem):
@@ -1250,6 +1428,159 @@ class ZoneList(QListWidget):
             if isinstance(scene, MapScene):
                 scene.zone_updated.emit(zone)
         self.update_zone_item(zone)
+
+
+class AllianceMembersTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        self.member_list = QListWidget(self)
+        self.member_list.itemDoubleClicked.connect(self._rename_member)
+        layout.addWidget(self.member_list)
+
+        controls = QHBoxLayout()
+        add_btn = QPushButton("Add Member", self)
+        remove_btn = QPushButton("Remove Selected", self)
+        controls.addWidget(add_btn)
+        controls.addWidget(remove_btn)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        add_btn.clicked.connect(self._add_member)
+        remove_btn.clicked.connect(self._remove_selected)
+
+    def _add_member(self):
+        name, ok = QInputDialog.getText(self, "Add Member", "Member name:")
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        self.member_list.addItem(name)
+
+    def _remove_selected(self):
+        for item in self.member_list.selectedItems():
+            self.member_list.takeItem(self.member_list.row(item))
+
+    def _rename_member(self, item: QListWidgetItem):
+        current = item.text()
+        name, ok = QInputDialog.getText(self, "Rename Member", "Member name:", text=current)
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        item.setText(name)
+
+
+class AllianceRolesTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        self.role_list = QListWidget(self)
+        self.role_list.itemDoubleClicked.connect(self._assign_member)
+        layout.addWidget(self.role_list)
+
+        controls = QHBoxLayout()
+        add_btn = QPushButton("Add Role", self)
+        rename_btn = QPushButton("Rename Role", self)
+        remove_btn = QPushButton("Remove Selected", self)
+        assign_btn = QPushButton("Assign Member", self)
+        controls.addWidget(add_btn)
+        controls.addWidget(rename_btn)
+        controls.addWidget(assign_btn)
+        controls.addWidget(remove_btn)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        add_btn.clicked.connect(self._prompt_add_role)
+        rename_btn.clicked.connect(self._rename_role)
+        remove_btn.clicked.connect(self._remove_selected)
+        assign_btn.clicked.connect(self._prompt_assign_member)
+
+        for role in ["Warlord", "Recruiter", "Muse", "Butler"]:
+            self._add_role(role)
+
+    def _role_data(self, role: str, member: Optional[str] = None) -> dict:
+        return {"role": role, "member": member}
+
+    def _update_item_text(self, item: QListWidgetItem):
+        data = item.data(Qt.UserRole) or {}
+        role = data.get("role", "Role")
+        member = data.get("member")
+        if member:
+            item.setText(f"{role} — {member}")
+        else:
+            item.setText(f"{role} (vacant)")
+
+    def _add_role(self, role: str, member: Optional[str] = None):
+        item = QListWidgetItem()
+        item.setData(Qt.UserRole, self._role_data(role, member))
+        self._update_item_text(item)
+        self.role_list.addItem(item)
+
+    def _prompt_add_role(self):
+        role, ok = QInputDialog.getText(self, "Add Role", "Role title:")
+        if not ok:
+            return
+        role = role.strip()
+        if not role:
+            return
+        self._add_role(role)
+
+    def _selected_role_item(self) -> Optional[QListWidgetItem]:
+        return self.role_list.currentItem()
+
+    def _rename_role(self):
+        item = self._selected_role_item()
+        if item is None:
+            return
+        data = item.data(Qt.UserRole) or {}
+        role = data.get("role", item.text())
+        new_role, ok = QInputDialog.getText(self, "Rename Role", "Role title:", text=role)
+        if not ok:
+            return
+        new_role = new_role.strip()
+        if not new_role:
+            return
+        data["role"] = new_role
+        item.setData(Qt.UserRole, data)
+        self._update_item_text(item)
+
+    def _remove_selected(self):
+        for item in self.role_list.selectedItems():
+            self.role_list.takeItem(self.role_list.row(item))
+
+    def _assign_member(self, item: QListWidgetItem):
+        data = item.data(Qt.UserRole) or {}
+        role = data.get("role", item.text())
+        member, ok = QInputDialog.getText(
+            self,
+            "Assign Member",
+            f"Assign member to {role} (leave blank for vacant):",
+            text=data.get("member") or "",
+        )
+        if not ok:
+            return
+        member = member.strip()
+        data["member"] = member or None
+        item.setData(Qt.UserRole, data)
+        self._update_item_text(item)
+
+    def _prompt_assign_member(self):
+        item = self._selected_role_item()
+        if item is None:
+            return
+        self._assign_member(item)
+
+
+class AllianceWidget(QTabWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.members_tab = AllianceMembersTab(self)
+        self.roles_tab = AllianceRolesTab(self)
+        self.addTab(self.members_tab, "Members")
+        self.addTab(self.roles_tab, "Roles")
 
 
 # ---------------------------- Palette Tabs ----------------------------
@@ -1399,6 +1730,12 @@ class MainWindow(QMainWindow):
         self.zone_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.zone_dock)
 
+        self.alliance_widget = AllianceWidget(self)
+        self.alliance_dock = QDockWidget("Alliance", self)
+        self.alliance_dock.setWidget(self.alliance_widget)
+        self.alliance_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.alliance_dock)
+
         # Status bar with coordinates + hint
         self.coord_label = QLabel("x: -, y: -")
         self.hint_label = QLabel("")
@@ -1437,8 +1774,11 @@ class MainWindow(QMainWindow):
         obj_action.setText("Objects Panel")
         zone_action = self.zone_dock.toggleViewAction()
         zone_action.setText("Zones Panel")
+        alliance_action = self.alliance_dock.toggleViewAction()
+        alliance_action.setText("Alliance Panel")
         self.panel_toolbar.addAction(obj_action)
         self.panel_toolbar.addAction(zone_action)
+        self.panel_toolbar.addAction(alliance_action)
 
         self.scene.zone_created.connect(self.zone_list.add_zone)
         self.scene.zone_updated.connect(self.zone_list.update_zone_item)
