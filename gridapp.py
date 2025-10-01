@@ -1378,7 +1378,8 @@ class PaletteList(QListWidget):
     def _item_label(self, spec: ObjectSpec) -> str:
         label = f"{spec.name}  ({spec.size_w}x{spec.size_h})"
         if spec.limit is not None:
-            label += f"  [max {spec.limit}]"
+            key_display = spec.limit_key or spec.name
+            label += f"  [max {spec.limit} — {key_display}]"
         return label
 
     def _refresh_item_display(self, item: QListWidgetItem, spec: ObjectSpec) -> None:
@@ -1398,6 +1399,8 @@ class PaletteList(QListWidget):
             "fill": QColor(spec.fill),
             "size_w": spec.size_w,
             "size_h": spec.size_h,
+            "limit": spec.limit,
+            "limit_key": spec.limit_key,
         }
         changed = False
         # Edit default text
@@ -1436,6 +1439,76 @@ class PaletteList(QListWidget):
             if spec.size_w != width or spec.size_h != height:
                 spec.size_w = width
                 spec.size_h = height
+                changed = True
+        # Edit limit
+        limit_prompt_text = "" if spec.limit is None else str(spec.limit)
+        new_limit = spec.limit
+        new_limit_key = spec.limit_key or spec.name
+        limit_confirmed = False
+        while True:
+            limit_text, ok_limit = QInputDialog.getText(
+                self,
+                "Placement limit",
+                "Maximum placements (leave blank for unlimited):",
+                text=limit_prompt_text,
+            )
+            if not ok_limit:
+                break
+            limit_text = limit_text.strip()
+            if not limit_text:
+                new_limit = None
+                new_limit_key = spec.name
+                limit_confirmed = True
+                break
+            try:
+                parsed_limit = int(limit_text)
+            except ValueError:
+                QMessageBox.information(
+                    self,
+                    "Invalid limit",
+                    "Enter a whole number greater than zero or leave blank for no limit.",
+                )
+                continue
+            if parsed_limit <= 0:
+                QMessageBox.information(
+                    self,
+                    "Invalid limit",
+                    "Limit must be greater than zero or left blank to remove the cap.",
+                )
+                continue
+            new_limit = parsed_limit
+            limit_confirmed = True
+            break
+
+        if limit_confirmed and new_limit is not None:
+            key_prompt_text = spec.limit_key or spec.name
+            while True:
+                key_text, ok_key = QInputDialog.getText(
+                    self,
+                    "Shared limit key",
+                    "Objects sharing this key count toward the same limit:",
+                    text=key_prompt_text,
+                )
+                if not ok_key:
+                    limit_confirmed = False
+                    break
+                key_text = key_text.strip()
+                if not key_text:
+                    QMessageBox.information(
+                        self,
+                        "Invalid key",
+                        "Limit key cannot be blank when a limit is set.",
+                    )
+                    continue
+                new_limit_key = key_text
+                break
+
+        if limit_confirmed:
+            if spec.limit != new_limit:
+                spec.limit = new_limit
+                changed = True
+            if spec.limit_key != new_limit_key:
+                spec.limit_key = new_limit_key
                 changed = True
         # Update list label/icon
         self._refresh_item_display(item, spec)
@@ -2413,6 +2486,8 @@ class MainWindow(QMainWindow):
             obj.updateLabelLayout()
             obj.spec.fill = QColor(spec.fill)
             obj.rect_item.setBrush(QBrush(obj.spec.fill))
+            obj.spec.limit = spec.limit
+            obj.spec.limit_key = spec.limit_key
             if size_changed:
                 old_w = obj.spec.size_w
                 old_h = obj.spec.size_h
