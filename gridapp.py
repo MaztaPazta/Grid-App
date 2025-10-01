@@ -18,7 +18,7 @@ from __future__ import annotations
 import math
 import sys
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Iterable, Optional
 
 from PySide6.QtCore import (
     QEvent,
@@ -84,6 +84,10 @@ DEFAULT_CATEGORIES: dict[str, list[ObjectSpec]] = {
 }
 
 
+def clone_spec(spec: ObjectSpec) -> ObjectSpec:
+    return ObjectSpec(spec.name, spec.size_w, spec.size_h, QColor(spec.fill))
+
+
 # ----------------------------- Map Items -------------------------------
 class MapObject(QGraphicsItemGroup):
     def __init__(self, spec: ObjectSpec, top_left: QPointF, cell_size: int):
@@ -130,10 +134,61 @@ class MapObject(QGraphicsItemGroup):
 
     def mouseDoubleClickEvent(self, event):
         # Rename via dialog
-        new_name, ok = QInputDialog.getText(None, "Rename object", "Enter name:", text=self.label_item.text())
+        new_name, ok = QInputDialog.getText(
+            None, "Edit object", "Enter name:", text=self.label_item.text()
+        )
         if ok and new_name.strip():
-            self.label_item.setText(new_name.strip())
+            final_name = new_name.strip()
+            self.spec.name = final_name
+            self.label_item.setText(final_name)
             self.updateLabelLayout()
+
+        color = QColorDialog.getColor(self.spec.fill, None, "Choose color")
+        if color.isValid():
+            self.spec.fill = QColor(color)
+            self.rect_item.setBrush(QBrush(self.spec.fill))
+
+        scene = self.scene()
+        max_size = GRID_CELLS
+        if isinstance(scene, MapScene):
+            max_size = scene.cells
+
+        width, ok_w = QInputDialog.getInt(
+            None,
+            "Width",
+            "Width (cells):",
+            value=self.spec.size_w,
+            min=1,
+            max=max_size,
+        )
+        height, ok_h = (self.spec.size_h, False)
+        if ok_w:
+            height, ok_h = QInputDialog.getInt(
+                None,
+                "Height",
+                "Height (cells):",
+                value=self.spec.size_h,
+                min=1,
+                max=max_size,
+            )
+
+        if ok_w and ok_h:
+            self.spec.size_w = width
+            self.spec.size_h = height
+            if isinstance(scene, MapScene):
+                self.cell_size = scene.cell_size
+            w = self.spec.size_w * self.cell_size
+            h = self.spec.size_h * self.cell_size
+            self.rect_item.setRect(0, 0, w, h)
+            self.updateLabelLayout()
+            if isinstance(scene, MapScene):
+                scene.snap_map_objects_to_grid([self])
+            else:
+                current_top_left = self.pos()
+                snapped_x = round(current_top_left.x() / self.cell_size) * self.cell_size
+                snapped_y = round(current_top_left.y() / self.cell_size) * self.cell_size
+                self.setPos(QPointF(snapped_x, snapped_y))
+
         super().mouseDoubleClickEvent(event)
 
     def mouseReleaseEvent(self, event):
@@ -141,17 +196,17 @@ class MapObject(QGraphicsItemGroup):
         scene = self.scene()
         if scene is None:
             return
-        cs = self.cell_size
-        w = self.spec.size_w * cs
-        h = self.spec.size_h * cs
-        current_top_left = self.pos()
-        snapped_x = round(current_top_left.x() / cs) * cs
-        snapped_y = round(current_top_left.y() / cs) * cs
         if isinstance(scene, MapScene):
-            top_left = scene._clamp_top_left(snapped_x, snapped_y, w, h)
+            map_objects = [item for item in scene.selectedItems() if isinstance(item, MapObject)]
+            if not map_objects:
+                map_objects = [self]
+            scene.snap_map_objects_to_grid(map_objects)
         else:
-            top_left = QPointF(snapped_x, snapped_y)
-        self.setPos(top_left)
+            cs = self.cell_size
+            current_top_left = self.pos()
+            snapped_x = round(current_top_left.x() / cs) * cs
+            snapped_y = round(current_top_left.y() / cs) * cs
+            self.setPos(QPointF(snapped_x, snapped_y))
 
 
 class PreviewObject(QGraphicsItemGroup):
@@ -238,6 +293,20 @@ class MapScene(QGraphicsScene):
         snapped_y = round(desired_top_left_y / cs) * cs
         return self._clamp_top_left(snapped_x, snapped_y, w, h)
 
+    def snap_map_objects_to_grid(self, objects: Iterable[MapObject]):
+        cs = self.cell_size
+        for obj in objects:
+            if not isinstance(obj, MapObject):
+                continue
+            obj.cell_size = cs
+            w = obj.spec.size_w * cs
+            h = obj.spec.size_h * cs
+            current_top_left = obj.pos()
+            snapped_x = round(current_top_left.x() / cs) * cs
+            snapped_y = round(current_top_left.y() / cs) * cs
+            top_left = self._clamp_top_left(snapped_x, snapped_y, w, h)
+            obj.setPos(top_left)
+
     # --- Placement tool API ---
     def set_active_spec(self, spec: Optional[ObjectSpec]):
         if self.preview_item is not None:
@@ -261,7 +330,7 @@ class MapScene(QGraphicsScene):
         if self.active_spec is None:
             return None
         pos = self._top_left_from_center_snap(scene_pos)
-        obj = MapObject(self.active_spec, pos, self.cell_size)
+        obj = MapObject(clone_spec(self.active_spec), pos, self.cell_size)
         self.addItem(obj)
         obj.updateLabelLayout()
         return obj
@@ -462,7 +531,29 @@ class PaletteList(QListWidget):
         # Edit color
         color = QColorDialog.getColor(spec.fill, self, "Choose color")
         if color.isValid():
-            spec.fill = color
+            spec.fill = QColor(color)
+        # Edit size
+        width, ok_w = QInputDialog.getInt(
+            self,
+            "Width",
+            "Width (cells):",
+            value=spec.size_w,
+            min=1,
+            max=GRID_CELLS,
+        )
+        height, ok_h = (spec.size_h, False)
+        if ok_w:
+            height, ok_h = QInputDialog.getInt(
+                self,
+                "Height",
+                "Height (cells):",
+                value=spec.size_h,
+                min=1,
+                max=GRID_CELLS,
+            )
+        if ok_w and ok_h:
+            spec.size_w = width
+            spec.size_h = height
         # Update list label
         item.setText(f"{spec.name}  ({spec.size_w}x{spec.size_h})")
         # If this spec is active, refresh preview
@@ -492,6 +583,15 @@ class PaletteTabWidget(QTabWidget):
         list_widget = PaletteList(specs, self)
         self.addTab(list_widget, name)
         return list_widget
+
+    def add_object_to_tab(self, tab_index: int, spec: ObjectSpec) -> None:
+        if tab_index < 0 or tab_index >= self.count():
+            raise IndexError("Tab index out of range")
+        widget = self.widget(tab_index)
+        if not isinstance(widget, PaletteList):
+            raise TypeError("Tab widget is not a PaletteList")
+        widget.specs.append(spec)
+        widget.populate()
 
     def _prompt_new_category(self):
         name, ok = QInputDialog.getText(self, "Add Category", "Category name:")
