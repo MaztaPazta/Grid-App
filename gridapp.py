@@ -328,11 +328,37 @@ class MapObject(QGraphicsItemGroup):
 
     def _prompt_change_color(self):
         color = QColorDialog.getColor(self.spec.fill, None, "Choose color")
-        if color.isValid():
-            self.spec.fill = QColor(color)
-            self.rect_item.setBrush(QBrush(self.spec.fill))
-            return True
-        return False
+        if not color.isValid():
+            return False
+
+        new_fill = QColor(color)
+        if new_fill == self.spec.fill:
+            return False
+
+        self.spec.fill = new_fill
+        self.rect_item.setBrush(QBrush(self.spec.fill))
+
+        scene = self.scene()
+        if scene is not None:
+            main_window = None
+            for view in scene.views():
+                window = view.window()
+                if isinstance(window, MainWindow):
+                    main_window = window
+                    break
+            if main_window is not None:
+                template_id = getattr(self.spec, "template_id", "")
+                if template_id:
+                    palette_spec = main_window.palette_tabs.update_spec_fill(
+                        template_id, self.spec.fill
+                    )
+                    if (
+                        palette_spec is not None
+                        and scene.active_spec is not None
+                        and getattr(scene.active_spec, "template_id", None) == template_id
+                    ):
+                        main_window.refresh_active_preview_if(scene.active_spec)
+        return True
 
     def _prompt_resize(self):
         scene = self.scene()
@@ -1422,9 +1448,29 @@ class PaletteList(QListWidget):
                 return spec
         return None
 
+    def find_spec_by_template(self, template_id: str) -> Optional[ObjectSpec]:
+        for spec in self.specs:
+            if spec.template_id == template_id:
+                return spec
+        return None
+
+    def _item_for_spec(self, spec: ObjectSpec) -> Optional[QListWidgetItem]:
+        for i in range(self.count()):
+            item = self.item(i)
+            if item is None:
+                continue
+            if item.data(Qt.UserRole) is spec:
+                return item
+        return None
+
     def _refresh_item_display(self, item: QListWidgetItem, spec: ObjectSpec) -> None:
         item.setText(self._item_label(spec))
         item.setIcon(create_color_icon(spec.fill))
+
+    def refresh_spec_item(self, spec: ObjectSpec) -> None:
+        item = self._item_for_spec(spec)
+        if item is not None:
+            self._refresh_item_display(item, spec)
 
     def _on_item_clicked(self, item: QListWidgetItem):
         spec: ObjectSpec = item.data(Qt.UserRole)
@@ -2291,6 +2337,25 @@ class PaletteTabWidget(QTabWidget):
                 spec = widget.find_spec_by_name(rank)
                 if spec is not None:
                     return QColor(spec.fill)
+        return None
+
+    def update_spec_fill(self, template_id: str, color: QColor) -> Optional[ObjectSpec]:
+        for i in range(self.count()):
+            widget = self.widget(i)
+            if not isinstance(widget, PaletteList):
+                continue
+            spec = widget.find_spec_by_template(template_id)
+            if spec is None:
+                continue
+            previous_fill = QColor(spec.fill)
+            if spec.fill != color:
+                spec.fill = QColor(color)
+                widget.refresh_spec_item(spec)
+                previous = {"name": spec.name, "fill": previous_fill}
+                self.handle_spec_changed(spec, previous)
+            else:
+                widget.refresh_spec_item(spec)
+            return spec
         return None
 
     def handle_spec_changed(self, spec: ObjectSpec, previous: dict) -> None:
