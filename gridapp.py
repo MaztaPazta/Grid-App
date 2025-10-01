@@ -40,6 +40,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication,
     QDockWidget,
+    QHBoxLayout,
     QGraphicsItem,
     QGraphicsItemGroup,
     QGraphicsRectItem,
@@ -53,10 +54,12 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QMenu,
     QSpinBox,
     QTabWidget,
     QToolBar,
     QToolButton,
+    QWidget,
 )
 
 
@@ -87,10 +90,12 @@ class ZoneSpec:
 
 DEFAULT_CATEGORIES: dict[str, list[ObjectSpec]] = {
     "Alliance": [
+        ObjectSpec("R1", 3, 3, QColor(Qt.lightGray)),
+        ObjectSpec("R2", 3, 3, QColor(Qt.lightGray)),
+        ObjectSpec("R3", 3, 3, QColor(Qt.lightGray)),
+        ObjectSpec("R4", 3, 3, QColor(Qt.lightGray)),
+        ObjectSpec("R5", 3, 3, QColor(Qt.lightGray)),
         ObjectSpec("Base", 3, 3, QColor(Qt.lightGray)),
-        ObjectSpec("Outpost", 2, 2, QColor(Qt.cyan)),
-        ObjectSpec("Resource", 2, 1, QColor(Qt.yellow)),
-        ObjectSpec("Relay", 1, 1, QColor(Qt.green)),
     ]
 }
 
@@ -158,7 +163,10 @@ class MapObject(QGraphicsItemGroup):
         self.label_item.setPos((w - label_rect.width()) / 2, (h - label_rect.height()) / 2)
 
     def mouseDoubleClickEvent(self, event):
-        # Rename via dialog
+        self._prompt_rename()
+        super().mouseDoubleClickEvent(event)
+
+    def _prompt_rename(self):
         new_name, ok = QInputDialog.getText(
             None, "Edit object", "Enter name:", text=self.label_item.text()
         )
@@ -167,12 +175,18 @@ class MapObject(QGraphicsItemGroup):
             self.spec.name = final_name
             self.label_item.setText(final_name)
             self.updateLabelLayout()
+            return True
+        return False
 
+    def _prompt_change_color(self):
         color = QColorDialog.getColor(self.spec.fill, None, "Choose color")
         if color.isValid():
             self.spec.fill = QColor(color)
             self.rect_item.setBrush(QBrush(self.spec.fill))
+            return True
+        return False
 
+    def _prompt_resize(self):
         scene = self.scene()
         max_size = GRID_CELLS
         if isinstance(scene, MapScene):
@@ -199,40 +213,55 @@ class MapObject(QGraphicsItemGroup):
                 max=max_size,
             )
 
-        if ok_w and ok_h:
-            self.spec.size_w = width
-            self.spec.size_h = height
-            if isinstance(scene, MapScene):
-                self.cell_size = scene.cell_size
-            w = self.spec.size_w * self.cell_size
-            h = self.spec.size_h * self.cell_size
-            self.rect_item.setRect(0, 0, w, h)
-            self.updateLabelLayout()
-            if isinstance(scene, MapScene):
-                scene.snap_items_to_grid([self])
-                if not scene.is_object_position_free(self):
-                    self.spec.size_w = old_w
-                    self.spec.size_h = old_h
-                    self.cell_size = scene.cell_size
-                    w = self.spec.size_w * self.cell_size
-                    h = self.spec.size_h * self.cell_size
-                    self.rect_item.setRect(0, 0, w, h)
-                    self.updateLabelLayout()
-                    scene.snap_items_to_grid([self])
-                    QMessageBox.information(
-                        None,
-                        "Overlap",
-                        "Cannot resize object because it would overlap another object.",
-                    )
-                else:
-                    self._last_valid_pos = QPointF(self.pos())
-            else:
-                current_top_left = self.pos()
-                snapped_x = round(current_top_left.x() / self.cell_size) * self.cell_size
-                snapped_y = round(current_top_left.y() / self.cell_size) * self.cell_size
-                self.setPos(QPointF(snapped_x, snapped_y))
+        if not (ok_w and ok_h):
+            return False
 
-        super().mouseDoubleClickEvent(event)
+        self.spec.size_w = width
+        self.spec.size_h = height
+        if isinstance(scene, MapScene):
+            self.cell_size = scene.cell_size
+        w = self.spec.size_w * self.cell_size
+        h = self.spec.size_h * self.cell_size
+        self.rect_item.setRect(0, 0, w, h)
+        self.updateLabelLayout()
+        if isinstance(scene, MapScene):
+            scene.snap_items_to_grid([self])
+            if not scene.is_object_position_free(self):
+                self.spec.size_w = old_w
+                self.spec.size_h = old_h
+                self.cell_size = scene.cell_size
+                w = self.spec.size_w * self.cell_size
+                h = self.spec.size_h * self.cell_size
+                self.rect_item.setRect(0, 0, w, h)
+                self.updateLabelLayout()
+                scene.snap_items_to_grid([self])
+                QMessageBox.information(
+                    None,
+                    "Overlap",
+                    "Cannot resize object because it would overlap another object.",
+                )
+                return False
+            self._last_valid_pos = QPointF(self.pos())
+        else:
+            current_top_left = self.pos()
+            snapped_x = round(current_top_left.x() / self.cell_size) * self.cell_size
+            snapped_y = round(current_top_left.y() / self.cell_size) * self.cell_size
+            self.setPos(QPointF(snapped_x, snapped_y))
+        return True
+
+    def contextMenuEvent(self, event):
+        menu = QMenu()
+        rename_action = menu.addAction("Rename")
+        color_action = menu.addAction("Change Color")
+        size_action = menu.addAction("Resize")
+        chosen = menu.exec(event.screenPos())
+        if chosen == rename_action:
+            self._prompt_rename()
+        elif chosen == color_action:
+            self._prompt_change_color()
+        elif chosen == size_action:
+            self._prompt_resize()
+        event.accept()
 
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
@@ -350,6 +379,15 @@ class MapZone(QGraphicsItemGroup):
         self.label_item.setPos((w - label_rect.width()) / 2, (h - label_rect.height()) / 2)
 
     def mouseDoubleClickEvent(self, event):
+        self._prompt_rename()
+        super().mouseDoubleClickEvent(event)
+
+    def _emit_zone_updated(self):
+        scene = self.scene()
+        if isinstance(scene, MapScene):
+            scene.zone_updated.emit(self)
+
+    def _prompt_rename(self):
         new_name, ok = QInputDialog.getText(
             None, "Edit zone", "Enter name:", text=self.label_item.text()
         )
@@ -358,26 +396,35 @@ class MapZone(QGraphicsItemGroup):
             self.spec.name = final_name
             self.label_item.setText(final_name)
             self.updateLabelLayout()
+            self._emit_zone_updated()
+            return True
+        return False
 
+    def _prompt_change_fill(self):
         fill_color = QColorDialog.getColor(self.spec.fill, None, "Choose fill color")
         if fill_color.isValid():
             self.spec.fill = QColor(fill_color)
             self.rect_item.setBrush(QBrush(self.spec.fill))
+            self._emit_zone_updated()
+            return True
+        return False
 
+    def _prompt_change_edge(self):
         edge_color = QColorDialog.getColor(self.spec.edge, None, "Choose edge color")
         if edge_color.isValid():
             self.spec.edge = QColor(edge_color)
             pen = self.rect_item.pen()
             pen.setColor(self.spec.edge)
             self.rect_item.setPen(pen)
+            self._emit_zone_updated()
+            return True
+        return False
 
+    def _prompt_resize(self):
         scene = self.scene()
         max_size = GRID_CELLS
         if isinstance(scene, MapScene):
             max_size = scene.cells
-
-        old_w = self.spec.size_w
-        old_h = self.spec.size_h
 
         width, ok_w = QInputDialog.getInt(
             None,
@@ -398,30 +445,151 @@ class MapZone(QGraphicsItemGroup):
                 max=max_size,
             )
 
-        if ok_w and ok_h:
-            self.spec.size_w = width
-            self.spec.size_h = height
-            if isinstance(scene, MapScene):
-                self.cell_size = scene.cell_size
-            w = self.spec.size_w * self.cell_size
-            h = self.spec.size_h * self.cell_size
-            self.rect_item.setRect(0, 0, w, h)
-            self.updateLabelLayout()
-            if isinstance(scene, MapScene):
-                scene.snap_items_to_grid([self])
-            else:
-                current_top_left = self.pos()
-                snapped_x = round(current_top_left.x() / self.cell_size) * self.cell_size
-                snapped_y = round(current_top_left.y() / self.cell_size) * self.cell_size
-                self.setPos(QPointF(snapped_x, snapped_y))
-        else:
-            self.spec.size_w = old_w
-            self.spec.size_h = old_h
+        if not (ok_w and ok_h):
+            return False
 
+        self.spec.size_w = width
+        self.spec.size_h = height
         if isinstance(scene, MapScene):
-            scene.zone_updated.emit(self)
+            self.cell_size = scene.cell_size
+        w = self.spec.size_w * self.cell_size
+        h = self.spec.size_h * self.cell_size
+        self.rect_item.setRect(0, 0, w, h)
+        self.updateLabelLayout()
+        if isinstance(scene, MapScene):
+            scene.snap_items_to_grid([self])
+        else:
+            current_top_left = self.pos()
+            snapped_x = round(current_top_left.x() / self.cell_size) * self.cell_size
+            snapped_y = round(current_top_left.y() / self.cell_size) * self.cell_size
+            self.setPos(QPointF(snapped_x, snapped_y))
 
-        super().mouseDoubleClickEvent(event)
+        self._emit_zone_updated()
+        return True
+
+    def _prompt_set_coordinates(self):
+        scene = self.scene()
+        if scene is None:
+            return False
+        cs = self.cell_size
+        max_cells = GRID_CELLS
+        if isinstance(scene, MapScene):
+            cs = scene.cell_size
+            max_cells = scene.cells
+
+        current_top_left = self.pos()
+        x_cells = int(round(current_top_left.x() / cs))
+        y_cells = int(round(current_top_left.y() / cs))
+        width_cells = self.spec.size_w
+        height_cells = self.spec.size_h
+
+        x, ok_x = QInputDialog.getInt(
+            None,
+            "Zone X",
+            "Top-left X (cells):",
+            value=x_cells,
+            min=0,
+            max=max_cells - 1,
+        )
+        if not ok_x:
+            return False
+        y, ok_y = QInputDialog.getInt(
+            None,
+            "Zone Y",
+            "Top-left Y (cells):",
+            value=y_cells,
+            min=0,
+            max=max_cells - 1,
+        )
+        if not ok_y:
+            return False
+        width, ok_w = QInputDialog.getInt(
+            None,
+            "Zone Width",
+            "Width (cells):",
+            value=width_cells,
+            min=1,
+            max=max_cells,
+        )
+        if not ok_w:
+            return False
+        height, ok_h = QInputDialog.getInt(
+            None,
+            "Zone Height",
+            "Height (cells):",
+            value=height_cells,
+            min=1,
+            max=max_cells,
+        )
+        if not ok_h:
+            return False
+
+        if x + width > max_cells or y + height > max_cells:
+            QMessageBox.warning(
+                None,
+                "Coordinates out of bounds",
+                "The specified zone extends beyond the map bounds.",
+            )
+            return False
+
+        self.spec.size_w = width
+        self.spec.size_h = height
+        if isinstance(scene, MapScene):
+            self.cell_size = scene.cell_size
+            cs = self.cell_size
+
+        w = self.spec.size_w * cs
+        h = self.spec.size_h * cs
+        self.rect_item.setRect(0, 0, w, h)
+        self.updateLabelLayout()
+
+        new_pos = QPointF(x * cs, y * cs)
+        if isinstance(scene, MapScene):
+            clamped = scene._clamp_top_left(new_pos.x(), new_pos.y(), w, h)
+            self.setPos(clamped)
+        else:
+            self.setPos(new_pos)
+
+        self._emit_zone_updated()
+        return True
+
+    def _trigger_redraw(self):
+        scene = self.scene()
+        if scene is None:
+            return False
+        main_window = None
+        for view in scene.views():
+            window = view.window()
+            if isinstance(window, MainWindow):
+                main_window = window
+                break
+        if main_window is None:
+            return False
+        main_window.begin_zone_redraw(self)
+        return True
+
+    def contextMenuEvent(self, event):
+        menu = QMenu()
+        rename_action = menu.addAction("Rename")
+        fill_action = menu.addAction("Change Fill Color")
+        edge_action = menu.addAction("Change Edge Color")
+        size_action = menu.addAction("Resize")
+        coord_action = menu.addAction("Set Coordinates...")
+        redraw_action = menu.addAction("Redraw Zone")
+        chosen = menu.exec(event.screenPos())
+        if chosen == rename_action:
+            self._prompt_rename()
+        elif chosen == fill_action:
+            self._prompt_change_fill()
+        elif chosen == edge_action:
+            self._prompt_change_edge()
+        elif chosen == size_action:
+            self._prompt_resize()
+        elif chosen == coord_action:
+            self._prompt_set_coordinates()
+        elif chosen == redraw_action:
+            self._trigger_redraw()
+        event.accept()
 
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
@@ -500,6 +668,7 @@ class MapScene(QGraphicsScene):
     zone_created = Signal(object)
     zone_updated = Signal(object)
     zone_removed = Signal(object)
+    zone_redraw_finished = Signal(object)
 
     def __init__(self, cells: int, cell_size: int, parent=None):
         super().__init__(parent)
@@ -524,6 +693,7 @@ class MapScene(QGraphicsScene):
         self.zone_hover_indicator: Optional[QGraphicsRectItem] = None
         self._zone_counter = 0
         self._zones: list[MapZone] = []
+        self._zone_redraw_target: Optional[MapZone] = None
 
     # --- Helpers ---
     def scene_width(self) -> float:
@@ -621,13 +791,24 @@ class MapScene(QGraphicsScene):
         self._zone_counter += 1
         return f"Zone {self._zone_counter}"
 
+    def prepare_zone_redraw(self, zone: MapZone):
+        self._zone_redraw_target = zone
+        self.zone_draw_start = None
+        if self.zone_draw_preview is not None:
+            self.zone_draw_preview.setVisible(False)
+        if self.zone_hover_indicator is not None:
+            self.zone_hover_indicator.setVisible(True)
+
     def set_zone_draw_mode(self, enabled: bool):
         if self.zone_draw_mode == enabled:
+            if not enabled:
+                self._zone_redraw_target = None
             return
         self.zone_draw_mode = enabled
         if not enabled:
             self.cancel_zone_draw()
             self.hide_zone_hover()
+            self._zone_redraw_target = None
         else:
             self.zone_draw_start = None
             self.show_zone_hover()
@@ -696,6 +877,22 @@ class MapScene(QGraphicsScene):
             return None
 
         top_left = QPointF(rect.left(), rect.top())
+        if self._zone_redraw_target is not None:
+            zone = self._zone_redraw_target
+            zone.spec.size_w = width_cells
+            zone.spec.size_h = height_cells
+            zone.cell_size = self.cell_size
+            w = zone.spec.size_w * self.cell_size
+            h = zone.spec.size_h * self.cell_size
+            zone.rect_item.setRect(0, 0, w, h)
+            zone.updateLabelLayout()
+            clamped = self._clamp_top_left(top_left.x(), top_left.y(), w, h)
+            zone.setPos(clamped)
+            self.zone_updated.emit(zone)
+            self.zone_redraw_finished.emit(zone)
+            self._zone_redraw_target = None
+            return zone
+
         spec = ZoneSpec(
             self._next_zone_name(),
             width_cells,
@@ -718,6 +915,7 @@ class MapScene(QGraphicsScene):
             self.show_zone_hover()
         else:
             self.hide_zone_hover()
+        self._zone_redraw_target = None
 
     def update_zone_hover(self, scene_pos: QPointF):
         if not self.zone_draw_mode:
@@ -1061,10 +1259,24 @@ class PaletteTabWidget(QTabWidget):
         self.setMovable(True)
         self.tabBarDoubleClicked.connect(self._rename_category)
 
-        add_btn = QToolButton(self)
-        add_btn.setText("+")
-        add_btn.clicked.connect(self._prompt_new_category)
-        self.setCornerWidget(add_btn, Qt.TopRightCorner)
+        corner_widget = QWidget(self)
+        corner_layout = QHBoxLayout(corner_widget)
+        corner_layout.setContentsMargins(0, 0, 0, 0)
+        corner_layout.setSpacing(2)
+
+        add_object_btn = QToolButton(corner_widget)
+        add_object_btn.setText("+Obj")
+        add_object_btn.setToolTip("Add object to current tab")
+        add_object_btn.clicked.connect(self._prompt_new_object)
+        corner_layout.addWidget(add_object_btn)
+
+        add_tab_btn = QToolButton(corner_widget)
+        add_tab_btn.setText("+Tab")
+        add_tab_btn.setToolTip("Add new category tab")
+        add_tab_btn.clicked.connect(self._prompt_new_category)
+        corner_layout.addWidget(add_tab_btn)
+
+        self.setCornerWidget(corner_widget, Qt.TopRightCorner)
 
         for name, specs in DEFAULT_CATEGORIES.items():
             self.add_category(name, specs)
@@ -1084,6 +1296,49 @@ class PaletteTabWidget(QTabWidget):
             raise TypeError("Tab widget is not a PaletteList")
         widget.specs.append(spec)
         widget.populate()
+        widget.setCurrentRow(widget.count() - 1)
+
+    def _prompt_new_object(self):
+        index = self.currentIndex()
+        if index < 0:
+            return
+
+        name, ok = QInputDialog.getText(self, "Add Object", "Object name:")
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+
+        width, ok_w = QInputDialog.getInt(
+            self,
+            "Width",
+            "Width (cells):",
+            value=3,
+            min=1,
+            max=GRID_CELLS,
+        )
+        if not ok_w:
+            return
+        height, ok_h = QInputDialog.getInt(
+            self,
+            "Height",
+            "Height (cells):",
+            value=3,
+            min=1,
+            max=GRID_CELLS,
+        )
+        if not ok_h:
+            return
+
+        color = QColorDialog.getColor(QColor(Qt.lightGray), self, "Choose color")
+        if color.isValid():
+            fill = QColor(color)
+        else:
+            fill = QColor(Qt.lightGray)
+
+        spec = ObjectSpec(name, width, height, fill)
+        self.add_object_to_tab(index, spec)
 
     def _prompt_new_category(self):
         name, ok = QInputDialog.getText(self, "Add Category", "Category name:")
@@ -1188,6 +1443,7 @@ class MainWindow(QMainWindow):
         self.scene.zone_created.connect(self.zone_list.add_zone)
         self.scene.zone_updated.connect(self.zone_list.update_zone_item)
         self.scene.zone_removed.connect(self.zone_list.remove_zone)
+        self.scene.zone_redraw_finished.connect(self._on_zone_redraw_finished)
 
     def activate_placement(self, spec: ObjectSpec):
         self.set_zone_draw_mode(False)
@@ -1218,6 +1474,22 @@ class MainWindow(QMainWindow):
             )
         elif self.scene.active_spec is None:
             self.clear_placement_hint()
+
+    def begin_zone_redraw(self, zone: MapZone):
+        if not self.scene.zone_draw_mode:
+            self.set_zone_draw_mode(True)
+        self.scene.prepare_zone_redraw(zone)
+        zone.setSelected(True)
+        for view in self.scene.views():
+            view.centerOn(zone)
+            break
+        self.hint_label.setText(
+            "Redraw zone: Click and drag to define the new area. Right-click to cancel."
+        )
+
+    def _on_zone_redraw_finished(self, zone: MapZone):
+        self.set_zone_draw_mode(False)
+        zone.setSelected(True)
 
     def _on_zone_draw_toggled(self, checked: bool):
         self.set_zone_draw_mode(checked)
