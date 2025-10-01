@@ -25,12 +25,14 @@ from PySide6.QtCore import (
     QPointF,
     QRectF,
     Qt,
+    Signal,
 )
 from PySide6.QtGui import (
     QAction,
     QBrush,
     QFont,
     QGuiApplication,
+    QCursor,
     QPainter,
     QPen,
     QColor,
@@ -93,24 +95,12 @@ DEFAULT_CATEGORIES: dict[str, list[ObjectSpec]] = {
 }
 
 
-DEFAULT_ZONES: list[ZoneSpec] = [
-    ZoneSpec("Safe", 5, 5, QColor(0, 255, 0, 60), QColor(Qt.green)),
-    ZoneSpec("Danger", 6, 6, QColor(255, 0, 0, 60), QColor(Qt.red)),
-]
+DEFAULT_ZONE_FILL = QColor(255, 0, 0, 60)
+DEFAULT_ZONE_EDGE = QColor(Qt.red)
 
 
 def clone_spec(spec: ObjectSpec) -> ObjectSpec:
     return ObjectSpec(spec.name, spec.size_w, spec.size_h, QColor(spec.fill))
-
-
-def clone_zone_spec(spec: ZoneSpec) -> ZoneSpec:
-    return ZoneSpec(
-        spec.name,
-        spec.size_w,
-        spec.size_h,
-        QColor(spec.fill),
-        QColor(spec.edge),
-    )
 
 
 # ----------------------------- Map Items -------------------------------
@@ -428,6 +418,9 @@ class MapZone(QGraphicsItemGroup):
             self.spec.size_w = old_w
             self.spec.size_h = old_h
 
+        if isinstance(scene, MapScene):
+            scene.zone_updated.emit(self)
+
         super().mouseDoubleClickEvent(event)
 
     def mouseReleaseEvent(self, event):
@@ -447,47 +440,6 @@ class MapZone(QGraphicsItemGroup):
             snapped_y = round(current_top_left.y() / cs) * cs
             self.setPos(QPointF(snapped_x, snapped_y))
 
-
-class PreviewZone(QGraphicsItemGroup):
-    def __init__(self, spec: ZoneSpec, cell_size: int):
-        super().__init__()
-        self.spec = spec
-        self.cell_size = cell_size
-
-        w = spec.size_w * cell_size
-        h = spec.size_h * cell_size
-        rect_item = QGraphicsRectItem(0, 0, w, h)
-        rect_item.setBrush(QBrush(spec.fill))
-        pen = QPen(spec.edge, 2)
-        pen.setStyle(Qt.DashLine)
-        rect_item.setPen(pen)
-
-        label = QGraphicsSimpleTextItem(spec.name)
-        font = QFont()
-        font.setPointSizeF(max(8.0, cell_size * 0.4))
-        label.setFont(font)
-        label_rect = label.boundingRect()
-        label.setPos((w - label_rect.width()) / 2, (h - label_rect.height()) / 2)
-
-        self.addToGroup(rect_item)
-        self.addToGroup(label)
-        self.rect_item = rect_item
-        self.label_item = label
-
-        self.setOpacity(0.35)
-        self.setZValue(900)
-        self.setAcceptedMouseButtons(Qt.NoButton)
-
-    def update_for_cell_size(self, cell_size: int):
-        self.cell_size = cell_size
-        w = self.spec.size_w * cell_size
-        h = self.spec.size_h * cell_size
-        self.rect_item.setRect(0, 0, w, h)
-        font = self.label_item.font()
-        font.setPointSizeF(max(8.0, cell_size * 0.4))
-        self.label_item.setFont(font)
-        label_rect = self.label_item.boundingRect()
-        self.label_item.setPos((w - label_rect.width()) / 2, (h - label_rect.height()) / 2)
 
 class GridLinesItem(QGraphicsItem):
     def __init__(self, map_scene: "MapScene"):
@@ -545,6 +497,10 @@ class GridLinesItem(QGraphicsItem):
 
 # ----------------------------- Scene/View ------------------------------
 class MapScene(QGraphicsScene):
+    zone_created = Signal(object)
+    zone_updated = Signal(object)
+    zone_removed = Signal(object)
+
     def __init__(self, cells: int, cell_size: int, parent=None):
         super().__init__(parent)
         self.cells = cells
@@ -556,12 +512,18 @@ class MapScene(QGraphicsScene):
         self.setItemIndexMethod(QGraphicsScene.NoIndex)
 
         # Placement tool state
-        self.active_spec: Optional[ObjectSpec | ZoneSpec] = None
-        self.active_is_zone = False
+        self.active_spec: Optional[ObjectSpec] = None
         self.preview_item: Optional[QGraphicsItemGroup] = None
         self.grid_item = GridLinesItem(self)
         self.addItem(self.grid_item)
         self.grid_item.setVisible(self.show_grid)
+
+        self.zone_draw_mode = False
+        self.zone_draw_start: Optional[QPointF] = None
+        self.zone_draw_preview: Optional[QGraphicsRectItem] = None
+        self.zone_hover_indicator: Optional[QGraphicsRectItem] = None
+        self._zone_counter = 0
+        self._zones: list[MapZone] = []
 
     # --- Helpers ---
     def scene_width(self) -> float:
@@ -618,17 +580,13 @@ class MapScene(QGraphicsScene):
         return self.is_area_free_for_object(rect, obj)
 
     # --- Placement tool API ---
-    def set_active_spec(self, spec: Optional[ObjectSpec | ZoneSpec], is_zone: bool = False):
+    def set_active_spec(self, spec: Optional[ObjectSpec]):
         if self.preview_item is not None:
             self.removeItem(self.preview_item)
             self.preview_item = None
         self.active_spec = spec
-        self.active_is_zone = bool(spec is not None and is_zone)
         if spec is not None:
-            if self.active_is_zone and isinstance(spec, ZoneSpec):
-                self.preview_item = PreviewZone(spec, self.cell_size)
-            else:
-                self.preview_item = PreviewObject(spec, self.cell_size)  # type: ignore[arg-type]
+            self.preview_item = PreviewObject(spec, self.cell_size)
             self.addItem(self.preview_item)
 
     def cancel_placement(self):
@@ -644,12 +602,6 @@ class MapScene(QGraphicsScene):
         if self.active_spec is None:
             return None
         pos = self._top_left_from_center_snap(scene_pos)
-        if self.active_is_zone and isinstance(self.active_spec, ZoneSpec):
-            zone = MapZone(clone_zone_spec(self.active_spec), pos, self.cell_size)
-            self.addItem(zone)
-            zone.updateLabelLayout()
-            return zone
-        assert isinstance(self.active_spec, ObjectSpec)
         rect = QRectF(
             pos.x(),
             pos.y(),
@@ -664,6 +616,152 @@ class MapScene(QGraphicsScene):
         obj.updateLabelLayout()
         obj._last_valid_pos = QPointF(obj.pos())
         return obj
+
+    def _next_zone_name(self) -> str:
+        self._zone_counter += 1
+        return f"Zone {self._zone_counter}"
+
+    def set_zone_draw_mode(self, enabled: bool):
+        if self.zone_draw_mode == enabled:
+            return
+        self.zone_draw_mode = enabled
+        if not enabled:
+            self.cancel_zone_draw()
+            self.hide_zone_hover()
+        else:
+            self.zone_draw_start = None
+            self.show_zone_hover()
+
+    def snap_to_grid_corner(self, scene_pos: QPointF) -> QPointF:
+        cs = self.cell_size
+        x = round(scene_pos.x() / cs) * cs
+        y = round(scene_pos.y() / cs) * cs
+        x = max(0, min(self.scene_width(), x))
+        y = max(0, min(self.scene_height(), y))
+        return QPointF(x, y)
+
+    def is_drawing_zone(self) -> bool:
+        return self.zone_draw_mode and self.zone_draw_start is not None
+
+    def begin_zone_draw(self, start: QPointF):
+        if not self.zone_draw_mode:
+            return
+        self.zone_draw_start = start
+        if self.zone_hover_indicator is not None:
+            self.zone_hover_indicator.setVisible(False)
+        if self.zone_draw_preview is None:
+            preview = QGraphicsRectItem()
+            preview.setBrush(QBrush(QColor(DEFAULT_ZONE_FILL)))
+            pen = QPen(QColor(DEFAULT_ZONE_EDGE), 2)
+            pen.setStyle(Qt.DashLine)
+            preview.setPen(pen)
+            preview.setOpacity(0.35)
+            preview.setZValue(950)
+            preview.setAcceptedMouseButtons(Qt.NoButton)
+            self.zone_draw_preview = preview
+            self.addItem(preview)
+        self.zone_draw_preview.setVisible(True)
+        rect = QRectF(start, start).normalized()
+        self.zone_draw_preview.setRect(rect)
+
+    def update_zone_draw(self, scene_pos: QPointF):
+        if not self.is_drawing_zone() or self.zone_draw_preview is None:
+            return
+        end = self.snap_to_grid_corner(scene_pos)
+        rect = QRectF(self.zone_draw_start, end).normalized()
+        if rect.width() == 0 and rect.height() == 0:
+            rect = QRectF(end, end)
+        self.zone_draw_preview.setRect(rect)
+
+    def finish_zone_draw(self, scene_pos: QPointF) -> Optional[MapZone]:
+        if not self.is_drawing_zone():
+            return None
+        end = self.snap_to_grid_corner(scene_pos)
+        start = self.zone_draw_start
+        self.zone_draw_start = None
+        if self.zone_draw_preview is not None:
+            self.zone_draw_preview.setVisible(False)
+        if self.zone_hover_indicator is not None:
+            self.zone_hover_indicator.setVisible(True)
+
+        self.update_zone_hover(end)
+        if start == end:
+            return None
+
+        rect = QRectF(start, end).normalized()
+        cs = self.cell_size
+        width_cells = int(round(rect.width() / cs))
+        height_cells = int(round(rect.height() / cs))
+        if width_cells == 0 or height_cells == 0:
+            return None
+
+        top_left = QPointF(rect.left(), rect.top())
+        spec = ZoneSpec(
+            self._next_zone_name(),
+            width_cells,
+            height_cells,
+            QColor(DEFAULT_ZONE_FILL),
+            QColor(DEFAULT_ZONE_EDGE),
+        )
+        zone = MapZone(spec, top_left, self.cell_size)
+        self.addItem(zone)
+        zone.updateLabelLayout()
+        self._zones.append(zone)
+        self.zone_created.emit(zone)
+        return zone
+
+    def cancel_zone_draw(self):
+        self.zone_draw_start = None
+        if self.zone_draw_preview is not None:
+            self.zone_draw_preview.setVisible(False)
+        if self.zone_draw_mode:
+            self.show_zone_hover()
+        else:
+            self.hide_zone_hover()
+
+    def update_zone_hover(self, scene_pos: QPointF):
+        if not self.zone_draw_mode:
+            return
+        snapped = self.snap_to_grid_corner(scene_pos)
+        if self.zone_hover_indicator is None:
+            indicator = QGraphicsRectItem(0, 0, self.cell_size, self.cell_size)
+            pen = QPen(QColor(DEFAULT_ZONE_EDGE))
+            pen.setStyle(Qt.DotLine)
+            pen.setWidth(2)
+            indicator.setPen(pen)
+            indicator.setBrush(Qt.NoBrush)
+            indicator.setZValue(900)
+            indicator.setAcceptedMouseButtons(Qt.NoButton)
+            self.zone_hover_indicator = indicator
+            self.addItem(indicator)
+        rect = QRectF(0, 0, self.cell_size, self.cell_size)
+        self.zone_hover_indicator.setRect(rect)
+        self.zone_hover_indicator.setPos(snapped)
+        self.zone_hover_indicator.setVisible(not self.is_drawing_zone())
+
+    def hide_zone_hover(self):
+        if self.zone_hover_indicator is not None:
+            self.zone_hover_indicator.setVisible(False)
+
+    def show_zone_hover(self):
+        if self.zone_hover_indicator is not None:
+            self.zone_hover_indicator.setVisible(True)
+
+    def update_zone_draw_visuals(self):
+        if self.zone_hover_indicator is not None:
+            self.zone_hover_indicator.setRect(QRectF(0, 0, self.cell_size, self.cell_size))
+        if self.zone_draw_preview is not None:
+            pen = self.zone_draw_preview.pen()
+            pen.setColor(QColor(DEFAULT_ZONE_EDGE))
+            self.zone_draw_preview.setPen(pen)
+            self.zone_draw_preview.setBrush(QBrush(QColor(DEFAULT_ZONE_FILL)))
+
+    def remove_map_item(self, item: QGraphicsItemGroup):
+        self.removeItem(item)
+        if isinstance(item, MapZone):
+            if item in self._zones:
+                self._zones.remove(item)
+            self.zone_removed.emit(item)
 
     # --- Painting ---
     def drawBackground(self, painter: QPainter, rect: QRectF):
@@ -702,6 +800,24 @@ class MapView(QGraphicsView):
 
     def mousePressEvent(self, event):
         scene: MapScene = self.scene()
+        if scene.zone_draw_mode:
+            if event.button() == Qt.RightButton:
+                scene_pos = self.mapToScene(event.position().toPoint())
+                if scene.is_drawing_zone():
+                    scene.cancel_zone_draw()
+                    scene.update_zone_hover(scene_pos)
+                else:
+                    window = self.window()
+                    if hasattr(window, "set_zone_draw_mode"):
+                        window.set_zone_draw_mode(False)
+                event.accept()
+                return
+            if event.button() == Qt.LeftButton:
+                scene_pos = self.mapToScene(event.position().toPoint())
+                snapped = scene.snap_to_grid_corner(scene_pos)
+                scene.begin_zone_draw(snapped)
+                event.accept()
+                return
         if scene.active_spec is not None:
             window = self.window()
             if event.button() == Qt.RightButton:
@@ -759,6 +875,15 @@ class MapView(QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        scene: MapScene = self.scene()
+        if scene.zone_draw_mode:
+            p = event.position()
+            scene_pos = self.mapToScene(int(p.x()), int(p.y()))
+            scene.update_zone_hover(scene_pos)
+            if scene.is_drawing_zone():
+                scene.update_zone_draw(scene_pos)
+            event.accept()
+            return
         if self._panning:
             p = event.position()
             delta = QPointF(p.x(), p.y()) - self._pan_start
@@ -768,12 +893,18 @@ class MapView(QGraphicsView):
             event.accept()
             return
         # Update preview position when moving mouse
-        scene: MapScene = self.scene()
         p = event.position()
         scene.update_preview(self.mapToScene(int(p.x()), int(p.y())))
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        scene: MapScene = self.scene()
+        if scene.zone_draw_mode and event.button() == Qt.LeftButton:
+            zone = scene.finish_zone_draw(self.mapToScene(event.position().toPoint()))
+            if zone is not None:
+                zone.setSelected(True)
+            event.accept()
+            return
         if self._panning and (event.button() == Qt.MiddleButton or event.button() == Qt.LeftButton):
             self._panning = False
             self.setCursor(Qt.ArrowCursor)
@@ -794,7 +925,7 @@ class MapView(QGraphicsView):
                     to_remove.add(map_obj)
             if to_remove:
                 for obj in to_remove:
-                    scene.removeItem(obj)
+                    scene.remove_map_item(obj)
                 event.accept()
                 return
         super().keyPressEvent(event)
@@ -864,67 +995,63 @@ class PaletteList(QListWidget):
 
 
 class ZoneList(QListWidget):
-    def __init__(self, specs: list[ZoneSpec], parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.specs = specs
         self.setAlternatingRowColors(True)
-        self.populate()
         self.itemClicked.connect(self._on_item_clicked)
         self.itemDoubleClicked.connect(self._on_item_double_clicked)
 
-    def populate(self):
-        self.clear()
-        for spec in self.specs:
-            item = QListWidgetItem(f"{spec.name}  ({spec.size_w}x{spec.size_h})")
-            item.setData(Qt.UserRole, spec)
-            self.addItem(item)
+    def _zone_label(self, zone: MapZone) -> str:
+        return f"{zone.spec.name}  ({zone.spec.size_w}x{zone.spec.size_h})"
+
+    def add_zone(self, zone: MapZone):
+        item = QListWidgetItem(self._zone_label(zone))
+        item.setData(Qt.UserRole, zone)
+        self.addItem(item)
+
+    def remove_zone(self, zone: MapZone):
+        for i in range(self.count()):
+            item = self.item(i)
+            if item is None:
+                continue
+            if item.data(Qt.UserRole) is zone:
+                self.takeItem(i)
+                break
+
+    def update_zone_item(self, zone: MapZone):
+        for i in range(self.count()):
+            item = self.item(i)
+            if item is None:
+                continue
+            if item.data(Qt.UserRole) is zone:
+                item.setText(self._zone_label(zone))
+                break
 
     def _on_item_clicked(self, item: QListWidgetItem):
-        spec: ZoneSpec = item.data(Qt.UserRole)
-        w = self.window()
-        if isinstance(w, MainWindow):
-            w.activate_zone_placement(spec)
+        zone: Optional[MapZone] = item.data(Qt.UserRole)
+        if zone is None:
+            return
+        scene = zone.scene()
+        if isinstance(scene, MapScene):
+            scene.clearSelection()
+            zone.setSelected(True)
+            for view in scene.views():
+                view.centerOn(zone)
+                break
 
     def _on_item_double_clicked(self, item: QListWidgetItem):
-        spec: ZoneSpec = item.data(Qt.UserRole)
-        new_name, ok = QInputDialog.getText(self, "Edit zone name", "Name:", text=spec.name)
+        zone: Optional[MapZone] = item.data(Qt.UserRole)
+        if zone is None:
+            return
+        new_name, ok = QInputDialog.getText(self, "Rename zone", "Name:", text=zone.spec.name)
         if ok and new_name.strip():
-            spec.name = new_name.strip()
-
-        fill_color = QColorDialog.getColor(spec.fill, self, "Choose fill color")
-        if fill_color.isValid():
-            spec.fill = QColor(fill_color)
-
-        edge_color = QColorDialog.getColor(spec.edge, self, "Choose edge color")
-        if edge_color.isValid():
-            spec.edge = QColor(edge_color)
-
-        width, ok_w = QInputDialog.getInt(
-            self,
-            "Width",
-            "Width (cells):",
-            value=spec.size_w,
-            min=1,
-            max=GRID_CELLS,
-        )
-        height, ok_h = (spec.size_h, False)
-        if ok_w:
-            height, ok_h = QInputDialog.getInt(
-                self,
-                "Height",
-                "Height (cells):",
-                value=spec.size_h,
-                min=1,
-                max=GRID_CELLS,
-            )
-        if ok_w and ok_h:
-            spec.size_w = width
-            spec.size_h = height
-
-        item.setText(f"{spec.name}  ({spec.size_w}x{spec.size_h})")
-        w = self.window()
-        if isinstance(w, MainWindow):
-            w.refresh_active_preview_if(spec)
+            zone.spec.name = new_name.strip()
+            zone.label_item.setText(zone.spec.name)
+            zone.updateLabelLayout()
+            scene = zone.scene()
+            if isinstance(scene, MapScene):
+                scene.zone_updated.emit(zone)
+        self.update_zone_item(zone)
 
 
 # ---------------------------- Palette Tabs ----------------------------
@@ -1011,7 +1138,7 @@ class MainWindow(QMainWindow):
         self.object_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.object_dock)
 
-        self.zone_list = ZoneList(DEFAULT_ZONES, self)
+        self.zone_list = ZoneList(self)
         self.zone_dock = QDockWidget("Zones", self)
         self.zone_dock.setWidget(self.zone_list)
         self.zone_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
@@ -1036,6 +1163,12 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.act_toggle_grid)
 
         toolbar.addSeparator()
+        self.act_draw_zone = QAction("Draw Zone", self)
+        self.act_draw_zone.setCheckable(True)
+        self.act_draw_zone.triggered.connect(self._on_zone_draw_toggled)
+        toolbar.addAction(self.act_draw_zone)
+
+        toolbar.addSeparator()
         toolbar.addWidget(QLabel("Cell size:"))
         self.spin_cell = QSpinBox()
         self.spin_cell.setRange(5, 120)
@@ -1052,29 +1185,60 @@ class MainWindow(QMainWindow):
         self.panel_toolbar.addAction(obj_action)
         self.panel_toolbar.addAction(zone_action)
 
+        self.scene.zone_created.connect(self.zone_list.add_zone)
+        self.scene.zone_updated.connect(self.zone_list.update_zone_item)
+        self.scene.zone_removed.connect(self.zone_list.remove_zone)
+
     def activate_placement(self, spec: ObjectSpec):
-        self.scene.set_active_spec(spec, is_zone=False)
+        self.set_zone_draw_mode(False)
+        self.scene.set_active_spec(spec)
         self.hint_label.setText(
             f"Placing {spec.name}: Left-click to place, Shift+Click for multiple, Right-click to cancel"
         )
 
-    def activate_zone_placement(self, spec: ZoneSpec):
-        self.scene.set_active_spec(spec, is_zone=True)
-        self.hint_label.setText(
-            f"Placing zone {spec.name}: Left-click to place, Shift+Click for multiple, Right-click to cancel"
-        )
+    def set_zone_draw_mode(self, enabled: bool):
+        if enabled:
+            if self.scene.active_spec is not None:
+                self.scene.cancel_placement()
+        self.scene.set_zone_draw_mode(enabled)
+        if enabled:
+            views = self.scene.views()
+            if views:
+                view = views[0]
+                cursor_pos = view.mapFromGlobal(QCursor.pos())
+                if view.rect().contains(cursor_pos):
+                    scene_pos = view.mapToScene(cursor_pos)
+                    self.scene.update_zone_hover(scene_pos)
+        previous = self.act_draw_zone.blockSignals(True)
+        self.act_draw_zone.setChecked(enabled)
+        self.act_draw_zone.blockSignals(previous)
+        if enabled:
+            self.hint_label.setText(
+                "Draw zone: Click and drag to create a zone. Right-click to cancel or exit the tool"
+            )
+        elif self.scene.active_spec is None:
+            self.clear_placement_hint()
 
-    def refresh_active_preview_if(self, spec: ObjectSpec | ZoneSpec):
+    def _on_zone_draw_toggled(self, checked: bool):
+        self.set_zone_draw_mode(checked)
+
+    def refresh_active_preview_if(self, spec: ObjectSpec):
         if self.scene.active_spec is spec:
-            self.scene.set_active_spec(spec, is_zone=self.scene.active_is_zone)
+            self.scene.set_active_spec(spec)
 
     def clear_placement_hint(self):
         self.hint_label.setText("")
 
     def cancel_active_placement(self):
+        any_cancelled = False
         if self.scene.active_spec is not None:
             self.scene.cancel_placement()
-        self.clear_placement_hint()
+            any_cancelled = True
+        if self.scene.zone_draw_mode:
+            self.set_zone_draw_mode(False)
+            any_cancelled = True
+        if any_cancelled:
+            self.clear_placement_hint()
 
     def toggle_grid(self, checked: bool):
         self.scene.show_grid = checked
@@ -1115,9 +1279,10 @@ class MainWindow(QMainWindow):
                 snapped_y = round(top_left.y() / v) * v
                 clamped = self.scene._clamp_top_left(snapped_x, snapped_y, w, h)
                 item.setPos(clamped)
-            elif isinstance(item, (PreviewObject, PreviewZone)):
+            elif isinstance(item, PreviewObject):
                 item.update_for_cell_size(v)
         self.scene.update()
+        self.scene.update_zone_draw_visuals()
 
     def eventFilter(self, watched, event):
         # Show bottom-left-origin coordinates under cursor and drive preview visibility/position
@@ -1136,12 +1301,17 @@ class MainWindow(QMainWindow):
                 cy = max(1, min(cells, cy))
                 self.coord_label.setText(f"x: {cx}, y: {cy}")
                 self.scene.update_preview(scene_pos)
+                self.scene.update_zone_hover(scene_pos)
             elif event.type() == QEvent.Leave:
                 if self.scene.preview_item is not None:
                     self.scene.preview_item.setVisible(False)
+                if self.scene.zone_draw_mode:
+                    self.scene.hide_zone_hover()
             elif event.type() == QEvent.Enter:
                 if self.scene.preview_item is not None:
                     self.scene.preview_item.setVisible(True)
+                if self.scene.zone_draw_mode:
+                    self.scene.show_zone_hover()
         return super().eventFilter(watched, event)
 
 
