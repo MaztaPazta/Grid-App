@@ -69,6 +69,8 @@ from PySide6.QtWidgets import (
     QStyleOptionViewItem,
     QSpinBox,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QToolBar,
     QToolButton,
     QVBoxLayout,
@@ -79,9 +81,11 @@ from PySide6.QtWidgets import (
     QGraphicsScene,
     QGraphicsSimpleTextItem,
     QGraphicsView,
+    QHeaderView,
     QInputDialog,
     QFileDialog,
     QRadioButton,
+    QAbstractItemView,
 )
 from PySide6.QtSvg import QSvgGenerator
 
@@ -2543,13 +2547,32 @@ class AllianceMembersTab(QWidget):
         filter_row.addStretch(1)
         layout.addLayout(filter_row)
 
-        self.member_list = QListWidget(self)
-        self.member_list.setAlternatingRowColors(True)
-        self.member_list.itemDoubleClicked.connect(self._rename_member)
-        self.member_list.itemClicked.connect(self._on_member_clicked)
-        self.member_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.member_list.customContextMenuRequested.connect(self._show_context_menu)
-        layout.addWidget(self.member_list)
+        self.member_table = QTableWidget(self)
+        self.member_table.setColumnCount(5)
+        self.member_table.setHorizontalHeaderLabels(
+            ["Name", "Nickname", "Roles", "Rank", "Tags"]
+        )
+        self.member_table.setAlternatingRowColors(True)
+        self.member_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.member_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.member_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.member_table.verticalHeader().setVisible(False)
+        header = self.member_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(True)
+        self.member_table.itemDoubleClicked.connect(self._rename_member)
+        self.member_table.itemClicked.connect(self._on_member_clicked)
+        self.member_table.itemSelectionChanged.connect(self._on_selection_changed)
+        header.sortIndicatorChanged.connect(self._on_sort_indicator_changed)
+        self.member_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.member_table.customContextMenuRequested.connect(self._show_context_menu)
+        layout.addWidget(self.member_table)
+        self.member_table.setSortingEnabled(True)
+        self.member_table.horizontalHeader().setSortIndicatorShown(False)
+        self._rank_column_index = 3
+        self._active_sort_column: Optional[int] = None
+        self._active_sort_order = Qt.AscendingOrder
+        self._updating_sort_indicator = False
 
         controls = QHBoxLayout()
         add_btn = QPushButton("Add Member", self)
@@ -2612,31 +2635,121 @@ class AllianceMembersTab(QWidget):
             filtered.sort(
                 key=lambda m: (-RANK_ORDER.index(m.rank), m.sort_name().casefold())
             )
-        self.member_list.blockSignals(True)
-        self.member_list.clear()
-        selected_item: Optional[QListWidgetItem] = None
-        for member in filtered:
-            item = QListWidgetItem(member.display_text())
-            item.setData(Qt.UserRole, member.member_id)
-            self.member_list.addItem(item)
-            if previous_selected and member.member_id == previous_selected:
-                selected_item = item
-        if selected_item is not None:
-            self.member_list.setCurrentItem(selected_item)
-            self._selected_member_id = selected_item.data(Qt.UserRole)
-        elif self.member_list.count() > 0:
-            self.member_list.setCurrentRow(0)
-            current_item = self.member_list.currentItem()
-            self._selected_member_id = (
-                current_item.data(Qt.UserRole) if current_item is not None else None
-            )
+        table = self.member_table
+        header = table.horizontalHeader()
+        table.blockSignals(True)
+        table.setSortingEnabled(False)
+        table.clearContents()
+        table.setRowCount(len(filtered))
+        for row, member in enumerate(filtered):
+            name_item = QTableWidgetItem(member.name)
+            name_item.setData(Qt.UserRole, member.member_id)
+            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+            table.setItem(row, 0, name_item)
+
+            nickname_item = QTableWidgetItem(member.nickname or "")
+            nickname_item.setFlags(nickname_item.flags() & ~Qt.ItemIsEditable)
+            table.setItem(row, 1, nickname_item)
+
+            roles_text = ", ".join(member.roles)
+            roles_item = QTableWidgetItem(roles_text)
+            roles_item.setFlags(roles_item.flags() & ~Qt.ItemIsEditable)
+            table.setItem(row, 2, roles_item)
+
+            rank_item = QTableWidgetItem(member.rank)
+            rank_item.setFlags(rank_item.flags() & ~Qt.ItemIsEditable)
+            rank_item.setTextAlignment(Qt.AlignCenter)
+            table.setItem(row, 3, rank_item)
+
+            tags_text = ", ".join(member.tags)
+            tags_item = QTableWidgetItem(tags_text)
+            tags_item.setFlags(tags_item.flags() & ~Qt.ItemIsEditable)
+            table.setItem(row, 4, tags_item)
+
+        table.blockSignals(False)
+        table.setSortingEnabled(True)
+        if self.sort_checkbox.isChecked() and table.rowCount() > 0:
+            self._updating_sort_indicator = True
+            header.setSortIndicatorShown(True)
+            header.setSortIndicator(self._rank_column_index, Qt.DescendingOrder)
+            table.sortItems(self._rank_column_index, Qt.DescendingOrder)
+            self._updating_sort_indicator = False
+        elif self._active_sort_column is not None and table.rowCount() > 0:
+            self._updating_sort_indicator = True
+            header.setSortIndicatorShown(True)
+            header.setSortIndicator(self._active_sort_column, self._active_sort_order)
+            table.sortItems(self._active_sort_column, self._active_sort_order)
+            self._updating_sort_indicator = False
         else:
+            self._updating_sort_indicator = True
+            header.setSortIndicatorShown(False)
+            self._updating_sort_indicator = False
+            self._active_sort_column = None
+        selected_row = self._select_member_by_id(previous_selected)
+        if selected_row is None and table.rowCount() > 0:
+            first_id = self._member_id_from_row(0)
+            self._select_member_by_id(first_id)
+        elif table.rowCount() == 0:
+            table.clearSelection()
             self._selected_member_id = None
-        self.member_list.blockSignals(False)
         if activate and self._selected_member_id is not None:
             self._activate_member_by_id(self._selected_member_id)
         if self.tags_tab is not None:
             self.tags_tab.handle_members_changed()
+
+    def _member_id_from_item(self, item: Optional[QTableWidgetItem]) -> Optional[str]:
+        if not isinstance(item, QTableWidgetItem):
+            return None
+        member_id = item.data(Qt.UserRole)
+        return member_id if member_id else None
+
+    def _member_id_from_row(self, row: int) -> Optional[str]:
+        if row < 0:
+            return None
+        item = self.member_table.item(row, 0)
+        return self._member_id_from_item(item)
+
+    def _select_member_by_id(self, member_id: Optional[str]) -> Optional[int]:
+        if not member_id:
+            self.member_table.clearSelection()
+            self._selected_member_id = None
+            return None
+        for row in range(self.member_table.rowCount()):
+            item = self.member_table.item(row, 0)
+            if item is not None and item.data(Qt.UserRole) == member_id:
+                self.member_table.blockSignals(True)
+                self.member_table.clearSelection()
+                self.member_table.selectRow(row)
+                self.member_table.setCurrentCell(row, 0)
+                self.member_table.blockSignals(False)
+                self._selected_member_id = member_id
+                return row
+        self._selected_member_id = None
+        return None
+
+    def _on_selection_changed(self) -> None:
+        selection_model = self.member_table.selectionModel()
+        if selection_model is None:
+            self._selected_member_id = None
+            return
+        selected_rows = selection_model.selectedRows()
+        if not selected_rows:
+            self._selected_member_id = None
+            return
+        row = selected_rows[0].row()
+        member_id = self._member_id_from_row(row)
+        self._selected_member_id = member_id
+
+    def _on_sort_indicator_changed(self, column: int, order: Qt.SortOrder) -> None:
+        if self._updating_sort_indicator:
+            return
+        self._active_sort_column = column
+        self._active_sort_order = order
+        should_check = column == self._rank_column_index and order == Qt.DescendingOrder
+        if self.sort_checkbox.isChecked() != should_check:
+            self.sort_checkbox.blockSignals(True)
+            self.sort_checkbox.setChecked(should_check)
+            self.sort_checkbox.blockSignals(False)
 
     def _activate_member_by_id(self, member_id: Optional[str]):
         if member_id is None:
@@ -2688,22 +2801,26 @@ class AllianceMembersTab(QWidget):
             window.request_autosave()
 
     def _remove_selected(self):
-        selected_ids = [item.data(Qt.UserRole) for item in self.member_list.selectedItems()]
-        for member_id in selected_ids:
+        selection_model = self.member_table.selectionModel()
+        if selection_model is None:
+            return
+        selected_ids: list[str] = []
+        for index in selection_model.selectedRows():
+            member_id = self._member_id_from_row(index.row())
             if member_id:
-                self._remove_member_by_id(member_id)
+                selected_ids.append(member_id)
+        for member_id in selected_ids:
+            self._remove_member_by_id(member_id)
         self._refresh_list()
         window = self.window()
         if isinstance(window, MainWindow):
             window.request_autosave()
 
-    def _member_from_item(self, item: Optional[QListWidgetItem]) -> Optional[MemberData]:
-        if item is None:
-            return None
-        member_id = item.data(Qt.UserRole)
+    def _member_from_item(self, item: Optional[QTableWidgetItem]) -> Optional[MemberData]:
+        member_id = self._member_id_from_item(item)
         return self.get_member(member_id) if member_id else None
 
-    def _rename_member(self, item: QListWidgetItem):
+    def _rename_member(self, item: QTableWidgetItem):
         member = self._member_from_item(item)
         if member is None:
             return
@@ -2716,7 +2833,7 @@ class AllianceMembersTab(QWidget):
         member.name = name
         self._handle_member_identity_change(member)
 
-    def _on_member_clicked(self, item: QListWidgetItem):
+    def _on_member_clicked(self, item: QTableWidgetItem):
         member = self._member_from_item(item)
         if member is None:
             return
@@ -2724,10 +2841,11 @@ class AllianceMembersTab(QWidget):
         self._activate_member_by_id(member.member_id)
 
     def _show_context_menu(self, point):
-        item = self.member_list.itemAt(point)
+        item = self.member_table.itemAt(point)
         member = self._member_from_item(item)
         if member is None:
             return
+        self._select_member_by_id(member.member_id)
         menu = QMenu(self)
         nickname_action = menu.addAction("Set Nickname…")
         clear_nickname_action = None
@@ -2742,7 +2860,7 @@ class AllianceMembersTab(QWidget):
             action.setCheckable(True)
             action.setChecked(rank == member.rank)
             actions.append(action)
-        chosen = menu.exec(self.member_list.mapToGlobal(point))
+        chosen = menu.exec(self.member_table.viewport().mapToGlobal(point))
         if chosen is None:
             return
         if chosen == nickname_action:
