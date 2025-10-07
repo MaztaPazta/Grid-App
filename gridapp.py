@@ -55,6 +55,7 @@ from PySide6.QtWidgets import (
     QDockWidget,
     QColorDialog,
     QButtonGroup,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -81,7 +82,6 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QFileDialog,
     QRadioButton,
-    QSizePolicy,
 )
 from PySide6.QtSvg import QSvgGenerator
 
@@ -92,9 +92,6 @@ CELL_SIZE = 20    # pixels per cell (zoom lets you navigate efficiently)
 GRID_COLOR = Qt.gray
 GRID_THICK_COLOR = Qt.darkGray
 BACKGROUND_COLOR = Qt.white
-
-
-DRAW_DISTANCE_ROLE = Qt.UserRole + 42
 
 
 @dataclass
@@ -351,6 +348,7 @@ class MapObject(QGraphicsItemGroup):
         self.addToGroup(label)
         self.rect_item = rect_item
         self.label_item = label
+        self._detail_visible = True
 
         self.setFlags(
             QGraphicsItem.ItemIsMovable
@@ -378,6 +376,15 @@ class MapObject(QGraphicsItemGroup):
         fit_text_item_to_rect(self.label_item, w, h)
         label_rect = self.label_item.boundingRect()
         self.label_item.setPos((w - label_rect.width()) / 2, (h - label_rect.height()) / 2)
+
+    def set_detail_visible(self, visible: bool) -> None:
+        if self._detail_visible == visible:
+            return
+        self._detail_visible = visible
+        self.label_item.setVisible(visible)
+        pen = self.rect_item.pen()
+        pen.setWidth(2 if visible else 1)
+        self.rect_item.setPen(pen)
 
     def mouseDoubleClickEvent(self, event):
         self._prompt_rename()
@@ -525,7 +532,7 @@ class MapObject(QGraphicsItemGroup):
                     obj._last_valid_pos = QPointF(obj.pos())
                 else:
                     obj._last_valid_pos = QPointF(obj.pos())
-            scene.update_draw_distance_visibility()
+            scene.update_detail_visibility()
         else:
             cs = self.cell_size
             current_top_left = self.pos()
@@ -663,7 +670,7 @@ class ExportImageDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(
             QLabel(
-                "Choose the area to capture and how draw distance should be applied.",
+                "Choose the area to capture and the desired export format.",
                 self,
             )
         )
@@ -742,11 +749,6 @@ class ExportImageDialog(QDialog):
 
         layout.addWidget(self.coords_container)
 
-        self.rescale_checkbox = QCheckBox(
-            "Rescale draw distance to fit exported area", self
-        )
-        layout.addWidget(self.rescale_checkbox)
-
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -800,10 +802,53 @@ class ExportImageDialog(QDialog):
         return {
             "mode": mode,
             "coordinates": coords,
-            "rescale_draw_distance": self.rescale_checkbox.isChecked(),
             "format": fmt,
             "raster_width": raster_width,
         }
+
+
+class DisplaySettingsDialog(QDialog):
+    def __init__(
+        self,
+        cell_size: int,
+        detail_threshold: int,
+        cell_range: tuple[int, int],
+        detail_range: tuple[int, int],
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Display Settings")
+
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        layout.addLayout(form)
+
+        self.cell_spin = QSpinBox(self)
+        self.cell_spin.setRange(int(cell_range[0]), int(cell_range[1]))
+        self.cell_spin.setValue(int(cell_size))
+        form.addRow("Cell size (pixels per cell):", self.cell_spin)
+
+        self.detail_spin = QSpinBox(self)
+        self.detail_spin.setRange(int(detail_range[0]), int(detail_range[1]))
+        self.detail_spin.setSpecialValueText("Always show detail")
+        self.detail_spin.setValue(int(max(detail_range[0], min(detail_range[1], detail_threshold))))
+        form.addRow("Detail zoom threshold (cell size):", self.detail_spin)
+
+        hint = QLabel(
+            "Object and zone labels are hidden when the cell size falls below this threshold.",
+            self,
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_values(self) -> tuple[int, int]:
+        return self.cell_spin.value(), self.detail_spin.value()
 
 
 ZONE_CORNER_HANDLE_SIZE = 12
@@ -1008,6 +1053,7 @@ class MapZone(QGraphicsItemGroup):
         self._update_handles_geometry()
         self._update_handle_visibility(False)
         self._set_selection_pen(False)
+        self._detail_handles_enabled = True
 
     def bounding_rect_scene(self) -> QRectF:
         w = self.spec.size_w * self.cell_size
@@ -1044,8 +1090,9 @@ class MapZone(QGraphicsItemGroup):
             handle.update_position(w, h)
 
     def _update_handle_visibility(self, visible: bool):
+        final_visible = visible and self._detail_handles_enabled
         for handle in self._handles:
-            handle.setVisible(visible)
+            handle.setVisible(final_visible)
 
     def _update_handle_colors(self):
         for handle in self._handles:
@@ -1062,6 +1109,12 @@ class MapZone(QGraphicsItemGroup):
             self._update_handle_visibility(selected)
             self._set_selection_pen(selected)
         return super().itemChange(change, value)
+
+    def set_detail_visible(self, visible: bool) -> None:
+        self.label_item.setVisible(visible)
+        if self._detail_handles_enabled != visible:
+            self._detail_handles_enabled = visible
+            self._update_handle_visibility(self.isSelected())
 
     def mouseDoubleClickEvent(self, event):
         self._prompt_rename()
@@ -1289,7 +1342,7 @@ class MapZone(QGraphicsItemGroup):
             if not zones:
                 zones = [self]
             scene.snap_items_to_grid(zones)
-            scene.update_draw_distance_visibility()
+            scene.update_detail_visibility()
         else:
             cs = self.cell_size
             current_top_left = self.pos()
@@ -1378,7 +1431,7 @@ class MapScene(QGraphicsScene):
         self.addItem(self.grid_item)
         self.grid_item.setVisible(self.show_grid)
 
-        self._draw_distance_cells = 0
+        self._detail_cell_threshold = int(cell_size)
 
         self.zone_draw_mode = False
         self.zone_draw_start: Optional[QPointF] = None
@@ -1397,19 +1450,19 @@ class MapScene(QGraphicsScene):
         return float(self.sceneRect().height())
 
     @property
-    def draw_distance_cells(self) -> int:
-        return int(self._draw_distance_cells)
+    def detail_cell_threshold(self) -> int:
+        return int(self._detail_cell_threshold)
 
-    @draw_distance_cells.setter
-    def draw_distance_cells(self, cells: int) -> None:
-        cells = max(0, int(cells))
-        if cells == self._draw_distance_cells:
+    @detail_cell_threshold.setter
+    def detail_cell_threshold(self, threshold: int) -> None:
+        threshold = max(0, int(threshold))
+        if threshold == self._detail_cell_threshold:
             return
-        self._draw_distance_cells = cells
-        self.update_draw_distance_visibility()
+        self._detail_cell_threshold = threshold
+        self.update_detail_visibility()
 
-    def set_draw_distance_cells(self, cells: int) -> None:
-        self.draw_distance_cells = cells
+    def set_detail_cell_threshold(self, threshold: int) -> None:
+        self.detail_cell_threshold = threshold
 
     def current_view_rect(self) -> Optional[QRectF]:
         return self._current_view_rect()
@@ -1434,97 +1487,15 @@ class MapScene(QGraphicsScene):
         bottom = max(point.y() for point in corners)
         return QRectF(QPointF(left, top), QPointF(right, bottom))
 
-    def _show_all_draw_distance_hidden(self) -> None:
+    def update_detail_visibility(self) -> None:
+        show_objects = self._detail_cell_threshold <= 0 or self.cell_size >= self._detail_cell_threshold
+        zone_threshold = max(0, self._detail_cell_threshold - 4)
+        show_zones = zone_threshold <= 0 or self.cell_size >= zone_threshold
         for item in self.items():
-            if not isinstance(item, (MapObject, MapZone)):
-                continue
-            if not item.data(DRAW_DISTANCE_ROLE):
-                continue
-            item.setData(DRAW_DISTANCE_ROLE, None)
-            if not item.isVisible():
-                item.setVisible(True)
-
-    def update_draw_distance_visibility(
-        self, *, reference_rect: Optional[QRectF] = None
-    ) -> None:
-        if self._draw_distance_cells <= 0:
-            self._show_all_draw_distance_hidden()
-            return
-
-        rect = reference_rect if reference_rect is not None else self._current_view_rect()
-        if rect is None or rect.isEmpty():
-            return
-
-        radius_px = float(self._draw_distance_cells * self.cell_size)
-        if radius_px <= 0:
-            center = rect.center()
-            allowed_rect = QRectF(center, center)
-        else:
-            allowed_rect = QRectF(
-                rect.center().x() - radius_px,
-                rect.center().y() - radius_px,
-                radius_px * 2.0,
-                radius_px * 2.0,
-            )
-        allowed_rect = allowed_rect.intersected(self.sceneRect())
-        if radius_px >= max(self.scene_width(), self.scene_height()):
-            self._show_all_draw_distance_hidden()
-            return
-
-        for item in self.items():
-            if not isinstance(item, (MapObject, MapZone)):
-                continue
-            hidden_flag = bool(item.data(DRAW_DISTANCE_ROLE))
-            if not hidden_flag and not item.isVisible():
-                continue
-            item_rect = item.bounding_rect_scene()
-            visible = item_rect.intersects(allowed_rect)
-            if visible:
-                if hidden_flag:
-                    item.setData(DRAW_DISTANCE_ROLE, None)
-                    if not item.isVisible():
-                        item.setVisible(True)
-            else:
-                if not hidden_flag and item.isVisible():
-                    item.setVisible(False)
-                    item.setData(DRAW_DISTANCE_ROLE, True)
-
-    def capture_draw_distance_state(self) -> list[tuple[QGraphicsItem, bool, bool]]:
-        state: list[tuple[QGraphicsItem, bool, bool]] = []
-        for item in self.items():
-            if not isinstance(item, (MapObject, MapZone)):
-                continue
-            hidden_flag = bool(item.data(DRAW_DISTANCE_ROLE))
-            state.append((item, hidden_flag, item.isVisible()))
-        return state
-
-    def restore_draw_distance_state(
-        self, state: list[tuple[QGraphicsItem, bool, bool]]
-    ) -> None:
-        for item, hidden_flag, visible in state:
-            if item.scene() is not self:
-                continue
-            item.setData(DRAW_DISTANCE_ROLE, True if hidden_flag else None)
-            if item.isVisible() != visible:
-                item.setVisible(visible)
-
-    def apply_draw_distance_for_rect(
-        self, rect: QRectF, distance_cells: Optional[int] = None
-    ) -> tuple[int, list[tuple[QGraphicsItem, bool, bool]]]:
-        original_distance = self._draw_distance_cells
-        state = self.capture_draw_distance_state()
-        if distance_cells is None:
-            distance_cells = original_distance
-        self._draw_distance_cells = max(0, int(distance_cells))
-        self.update_draw_distance_visibility(reference_rect=rect)
-        return original_distance, state
-
-    def restore_draw_distance_after_rect(
-        self, original_distance: int, state: list[tuple[QGraphicsItem, bool, bool]]
-    ) -> None:
-        self._draw_distance_cells = max(0, int(original_distance))
-        self.restore_draw_distance_state(state)
-        self.update_draw_distance_visibility()
+            if isinstance(item, MapObject):
+                item.set_detail_visible(show_objects)
+            elif isinstance(item, MapZone):
+                item.set_detail_visible(show_zones)
 
     def _clamp_top_left(self, x: float, y: float, w: float, h: float) -> QPointF:
         x = max(0, min(self.scene_width() - w, x))
@@ -1636,7 +1607,7 @@ class MapScene(QGraphicsScene):
         self.addItem(obj)
         obj.updateLabelLayout()
         obj._last_valid_pos = QPointF(obj.pos())
-        self.update_draw_distance_visibility()
+        self.update_detail_visibility()
         self.object_placed.emit(obj)
         return obj
 
@@ -1757,7 +1728,7 @@ class MapScene(QGraphicsScene):
             self.zone_redraw_finished.emit(zone)
             self._zone_redraw_target = None
             self._zone_redraw_hidden_target = False
-            self.update_draw_distance_visibility()
+            self.update_detail_visibility()
             return zone
 
         spec = ZoneSpec(
@@ -1773,7 +1744,7 @@ class MapScene(QGraphicsScene):
         zone._update_handles_geometry()
         self._zones.append(zone)
         self.zone_created.emit(zone)
-        self.update_draw_distance_visibility()
+        self.update_detail_visibility()
         return zone
 
     def cancel_zone_draw(self):
@@ -1834,7 +1805,7 @@ class MapScene(QGraphicsScene):
             if item in self._zones:
                 self._zones.remove(item)
             self.zone_removed.emit(item)
-        self.update_draw_distance_visibility()
+        self.update_detail_visibility()
 
     def remove_objects_by_template(self, template_id: str) -> int:
         removed = 0
@@ -1866,7 +1837,7 @@ class MapView(QGraphicsView):
     def _notify_view_changed(self):
         scene = self.scene()
         if isinstance(scene, MapScene):
-            scene.update_draw_distance_visibility()
+            scene.update_detail_visibility()
 
     def _map_item_from_graphics_item(
         self, item: Optional[QGraphicsItem]
@@ -3381,14 +3352,20 @@ class MainWindow(QMainWindow):
         self.act_load_autosave.triggered.connect(self._load_autosave_from_menu)
         file_menu.addAction(self.act_load_autosave)
 
-        self.act_export_image = QAction("Export Image...", self)
-        self.act_export_image.triggered.connect(self.export_image)
-        file_menu.addAction(self.act_export_image)
-
         file_menu.addSeparator()
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
+
+        capture_menu = self.menuBar().addMenu("&Capture")
+        self.act_export_image = QAction("Export Image...", self)
+        self.act_export_image.triggered.connect(self.export_image)
+        capture_menu.addAction(self.act_export_image)
+
+        settings_menu = self.menuBar().addMenu("&Settings")
+        self.act_display_settings = QAction("Display Settings...", self)
+        self.act_display_settings.triggered.connect(self.open_display_settings)
+        settings_menu.addAction(self.act_display_settings)
 
         # Scene & View
         self.scene = MapScene(GRID_CELLS, CELL_SIZE, self)
@@ -3396,6 +3373,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.view)
         self.active_member: Optional[MemberData] = None
         self._active_member_spec: Optional[ObjectSpec] = None
+        self._cell_size_range = (5, 120)
+        self._detail_threshold_range = (0, self._cell_size_range[1])
 
         # Sidebar (dock)
         self.palette_tabs = PaletteTabWidget(self)
@@ -3441,36 +3420,6 @@ class MainWindow(QMainWindow):
         self.act_draw_zone.setCheckable(True)
         self.act_draw_zone.triggered.connect(self._on_zone_draw_toggled)
         toolbar.addAction(self.act_draw_zone)
-
-        toolbar.addSeparator()
-        toolbar.addWidget(QLabel("Cell size:"))
-        self.spin_cell = QSpinBox()
-        self.spin_cell.setRange(5, 120)
-        self.spin_cell.setValue(CELL_SIZE)
-        self.spin_cell.valueChanged.connect(self.change_cell_size)
-        toolbar.addWidget(self.spin_cell)
-
-        toolbar.addSeparator()
-        self.settings_tabs = QTabWidget(self)
-        self.settings_tabs.setMovable(False)
-        self.settings_tabs.setDocumentMode(True)
-        self.settings_tabs.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
-        self.settings_tabs.setMaximumWidth(320)
-
-        settings_page = QWidget(self)
-        settings_layout = QHBoxLayout(settings_page)
-        settings_layout.setContentsMargins(8, 4, 8, 4)
-        settings_layout.setSpacing(6)
-        settings_layout.addWidget(QLabel("Draw distance (cells):", settings_page))
-        self.spin_draw_distance = QSpinBox(settings_page)
-        self.spin_draw_distance.setRange(0, self.scene.cells)
-        self.spin_draw_distance.setSpecialValueText("Unlimited")
-        self.spin_draw_distance.setValue(0)
-        self.spin_draw_distance.valueChanged.connect(self.change_draw_distance)
-        settings_layout.addWidget(self.spin_draw_distance)
-        settings_layout.addStretch()
-        self.settings_tabs.addTab(settings_page, "Settings")
-        toolbar.addWidget(self.settings_tabs)
 
         self.panel_toolbar = QToolBar("Panels", self)
         self.addToolBar(self.panel_toolbar)
@@ -3669,7 +3618,11 @@ class MainWindow(QMainWindow):
         self.scene.update()
         self.request_autosave()
 
-    def change_cell_size(self, v: int):
+    def change_cell_size(self, value: int):
+        v = int(max(self._cell_size_range[0], min(self._cell_size_range[1], value)))
+        if v == self.scene.cell_size:
+            return
+
         # Rescale scene: update cell size, scene rect, and items
         self.scene.cell_size = v
         size_px = self.scene.cells * v
@@ -3707,12 +3660,30 @@ class MainWindow(QMainWindow):
                 item.update_for_cell_size(v)
         self.scene.update()
         self.scene.update_zone_draw_visuals()
-        self.scene.update_draw_distance_visibility()
+        self.scene.update_detail_visibility()
         self.request_autosave()
 
-    def change_draw_distance(self, cells: int):
-        self.scene.set_draw_distance_cells(cells)
+    def change_detail_threshold(self, threshold: int):
+        threshold = int(
+            max(self._detail_threshold_range[0], min(self._detail_threshold_range[1], threshold))
+        )
+        self.scene.set_detail_cell_threshold(threshold)
+        self.scene.update_detail_visibility()
         self.request_autosave()
+
+    def open_display_settings(self):
+        dialog = DisplaySettingsDialog(
+            self.scene.cell_size,
+            self.scene.detail_cell_threshold,
+            self._cell_size_range,
+            self._detail_threshold_range,
+            self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        cell_size, threshold = dialog.get_values()
+        self.change_cell_size(cell_size)
+        self.change_detail_threshold(threshold)
 
     def request_autosave(self):
         if self._loading_state:
@@ -3819,7 +3790,7 @@ class MainWindow(QMainWindow):
             "grid": {
                 "cell_size": self.scene.cell_size,
                 "show_grid": self.scene.show_grid,
-                "draw_distance": self.scene.draw_distance_cells,
+                "detail_threshold": self.scene.detail_cell_threshold,
             },
             "categories": categories,
             "members": members_data,
@@ -3889,9 +3860,7 @@ class MainWindow(QMainWindow):
         rect = QRectF(x, y, width_px, height_px)
         return rect.intersected(self.scene.sceneRect())
 
-    def _export_scene_to_svg(
-        self, path: Path, source_rect: QRectF, *, rescale_draw_distance: bool
-    ) -> None:
+    def _export_scene_to_svg(self, path: Path, source_rect: QRectF) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         generator = QSvgGenerator()
         generator.setFileName(str(path))
@@ -3902,13 +3871,6 @@ class MainWindow(QMainWindow):
         generator.setTitle("Last War Survivor — Alliance Map")
         generator.setDescription("Generated from Last War Survivor — Alliance Map Tool")
 
-        desired_distance = self.scene.draw_distance_cells
-        if rescale_draw_distance and desired_distance > 0:
-            required = int(
-                math.ceil(max(source_rect.width(), source_rect.height()) / (2 * self.scene.cell_size))
-            )
-            desired_distance = max(desired_distance, required)
-
         views = list(self.scene.views())
         viewport_states: list[tuple[QWidget, bool]] = []
         for view in views:
@@ -3917,14 +3879,7 @@ class MainWindow(QMainWindow):
             viewport.setUpdatesEnabled(False)
 
         painter = None
-        original_distance = self.scene.draw_distance_cells
-        state: list[tuple[QGraphicsItem, bool, bool]] = []
-        applied = False
         try:
-            original_distance, state = self.scene.apply_draw_distance_for_rect(
-                source_rect, desired_distance
-            )
-            applied = True
             painter = QPainter(generator)
             target_rect = QRectF(0, 0, source_rect.width(), source_rect.height())
             if target_rect.isEmpty():
@@ -3933,8 +3888,6 @@ class MainWindow(QMainWindow):
         finally:
             if painter is not None:
                 painter.end()
-            if applied:
-                self.scene.restore_draw_distance_after_rect(original_distance, state)
             for viewport, enabled in viewport_states:
                 viewport.setUpdatesEnabled(enabled)
                 if enabled:
@@ -3946,8 +3899,6 @@ class MainWindow(QMainWindow):
         source_rect: QRectF,
         width: int,
         fmt: str,
-        *,
-        rescale_draw_distance: bool,
     ) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         width = max(1, int(width))
@@ -3963,13 +3914,6 @@ class MainWindow(QMainWindow):
             image = QImage(width, height, QImage.Format_ARGB32_Premultiplied)
             image.fill(Qt.transparent)
 
-        desired_distance = self.scene.draw_distance_cells
-        if rescale_draw_distance and desired_distance > 0:
-            required = int(
-                math.ceil(max(source_rect.width(), source_rect.height()) / (2 * self.scene.cell_size))
-            )
-            desired_distance = max(desired_distance, required)
-
         views = list(self.scene.views())
         viewport_states: list[tuple[QWidget, bool]] = []
         for view in views:
@@ -3978,22 +3922,13 @@ class MainWindow(QMainWindow):
             viewport.setUpdatesEnabled(False)
 
         painter = None
-        original_distance = self.scene.draw_distance_cells
-        state: list[tuple[QGraphicsItem, bool, bool]] = []
-        applied = False
         try:
-            original_distance, state = self.scene.apply_draw_distance_for_rect(
-                source_rect, desired_distance
-            )
-            applied = True
             painter = QPainter(image)
             target_rect = QRectF(0, 0, float(width), float(height))
             self.scene.render(painter, target_rect, source_rect)
         finally:
             if painter is not None:
                 painter.end()
-            if applied:
-                self.scene.restore_draw_distance_after_rect(original_distance, state)
             for viewport, enabled in viewport_states:
                 viewport.setUpdatesEnabled(enabled)
                 if enabled:
@@ -4014,7 +3949,6 @@ class MainWindow(QMainWindow):
             return
         options = dialog.get_options()
         mode = options.get("mode", "view")
-        rescale = bool(options.get("rescale_draw_distance", False))
         fmt = str(options.get("format", "svg")).lower()
         if fmt == "jpeg":
             fmt = "jpg"
@@ -4078,7 +4012,7 @@ class MainWindow(QMainWindow):
 
         try:
             if fmt == "svg":
-                self._export_scene_to_svg(path, rect, rescale_draw_distance=rescale)
+                self._export_scene_to_svg(path, rect)
             else:
                 width = options.get("raster_width")
                 if not width:
@@ -4088,7 +4022,6 @@ class MainWindow(QMainWindow):
                     rect,
                     width,
                     fmt,
-                    rescale_draw_distance=rescale,
                 )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Export failed", f"Could not export image:\n{exc}")
@@ -4170,20 +4103,10 @@ class MainWindow(QMainWindow):
                 widget.deleteLater()
 
     def _apply_cell_size_value(self, cell_size: int):
-        cell_size = int(max(self.spin_cell.minimum(), min(self.spin_cell.maximum(), cell_size)))
-        previous = self.spin_cell.blockSignals(True)
-        self.spin_cell.setValue(cell_size)
-        self.spin_cell.blockSignals(previous)
-        self.change_cell_size(cell_size)
+        self.change_cell_size(int(cell_size))
 
-    def _apply_draw_distance_value(self, cells: int):
-        maximum = max(0, self.scene.cells)
-        self.spin_draw_distance.setMaximum(maximum)
-        cells = int(max(0, min(maximum, cells)))
-        previous = self.spin_draw_distance.blockSignals(True)
-        self.spin_draw_distance.setValue(cells)
-        self.spin_draw_distance.blockSignals(previous)
-        self.scene.set_draw_distance_cells(cells)
+    def _apply_detail_threshold_value(self, threshold: int):
+        self.change_detail_threshold(int(threshold))
 
     def _apply_grid_visibility(self, visible: bool):
         previous = self.act_toggle_grid.blockSignals(True)
@@ -4296,7 +4219,7 @@ class MainWindow(QMainWindow):
             template_id = getattr(spec, "template_id", "")
             if template_id and template_id.startswith("member:"):
                 members_tab.handle_member_object_placed(template_id, obj)
-        self.scene.update_draw_distance_visibility()
+        self.scene.update_detail_visibility()
 
     def _apply_zones_data(self, zones_data: list[dict], zone_counter: Optional[int]):
         self.scene._zones = []
@@ -4337,7 +4260,7 @@ class MainWindow(QMainWindow):
             counter = 0
         counter = max(counter, len(self.scene._zones))
         self.scene._zone_counter = counter
-        self.scene.update_draw_distance_visibility()
+        self.scene.update_detail_visibility()
 
     def _apply_state(self, data: dict):
         self.cancel_active_placement()
@@ -4346,7 +4269,10 @@ class MainWindow(QMainWindow):
         grid_data = data.get("grid", {})
         cell_size = grid_data.get("cell_size", self.scene.cell_size)
         show_grid = grid_data.get("show_grid", True)
-        draw_distance = grid_data.get("draw_distance", self.scene.draw_distance_cells)
+        detail_threshold = grid_data.get(
+            "detail_threshold",
+            grid_data.get("draw_distance", self.scene.detail_cell_threshold),
+        )
 
         self._apply_palette_data(data.get("categories"))
         MemberData.clear_rank_color_cache()
@@ -4356,7 +4282,7 @@ class MainWindow(QMainWindow):
 
         self._apply_cell_size_value(int(cell_size))
         self._apply_grid_visibility(bool(show_grid))
-        self._apply_draw_distance_value(int(draw_distance))
+        self._apply_detail_threshold_value(int(detail_threshold))
 
         self._apply_members_data(data.get("members", []))
         self._apply_roles_data(data.get("roles", []))
