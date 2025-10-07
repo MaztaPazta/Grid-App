@@ -134,6 +134,7 @@ class MemberData:
     member_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     rank: str = "R1"
     roles: List[str] = field(default_factory=list)
+    tags: List[str] = field(default_factory=list)
     map_object: Optional["MapObject"] = None
     template_id: str = field(init=False)
 
@@ -144,10 +145,14 @@ class MemberData:
         self.template_id = f"member:{self.member_id}"
 
     def display_text(self) -> str:
+        base = f"{self.rank} {self.name}"
         roles_text = ", ".join(self.roles)
         if roles_text:
-            return f"{self.rank} {self.name} — {roles_text}"
-        return f"{self.rank} {self.name}"
+            base = f"{base} — {roles_text}"
+        if self.tags:
+            tags_text = ", ".join(self.tags)
+            base = f"{base} [{tags_text}]"
+        return base
 
     def rank_color(self) -> QColor:
         cls = self.__class__
@@ -196,6 +201,11 @@ class MemberData:
     def clear_rank_color_cache(cls) -> None:
         cls._rank_color_cache.clear()
 
+
+@dataclass
+class TagRecord:
+    name: str
+    tag_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 @dataclass
 class RoleRecord:
@@ -2454,6 +2464,7 @@ class AllianceMembersTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.roles_tab: Optional["AllianceRolesTab"] = None
+        self.tags_tab: Optional["AllianceTagsTab"] = None
         self.members: List[MemberData] = []
         self._selected_member_id: Optional[str] = None
         self._deferred_select_id: Optional[str] = None
@@ -2472,6 +2483,10 @@ class AllianceMembersTab(QWidget):
         self.sort_checkbox = QCheckBox("Sort by rank", self)
         self.sort_checkbox.setChecked(True)
         filter_row.addWidget(self.sort_checkbox)
+        filter_row.addWidget(QLabel("Filter tags:"))
+        self.tag_filter_edit = QLineEdit(self)
+        self.tag_filter_edit.setPlaceholderText("Tag1, Tag2")
+        filter_row.addWidget(self.tag_filter_edit)
         filter_row.addStretch(1)
         layout.addLayout(filter_row)
 
@@ -2495,6 +2510,7 @@ class AllianceMembersTab(QWidget):
         remove_btn.clicked.connect(self._remove_selected)
         self.filter_combo.currentIndexChanged.connect(self._refresh_list)
         self.sort_checkbox.stateChanged.connect(self._refresh_list)
+        self.tag_filter_edit.textChanged.connect(self._refresh_list)
 
         self._refresh_list()
 
@@ -2523,6 +2539,22 @@ class AllianceMembersTab(QWidget):
             filtered = [member for member in self.members if member.rank == filter_rank]
         else:
             filtered = list(self.members)
+        tag_filters: list[str] = []
+        if hasattr(self, "tag_filter_edit"):
+            tag_text = self.tag_filter_edit.text().strip()
+            if tag_text:
+                tag_filters = [
+                    token.strip().casefold()
+                    for token in tag_text.split(",")
+                    if token.strip()
+                ]
+        if tag_filters:
+            filtered_members: list[MemberData] = []
+            for member in filtered:
+                member_tag_set = {existing.casefold() for existing in member.tags}
+                if all(tag in member_tag_set for tag in tag_filters):
+                    filtered_members.append(member)
+            filtered = filtered_members
         if self.sort_checkbox.isChecked():
             filtered.sort(key=lambda m: (-RANK_ORDER.index(m.rank), m.name.lower()))
         self.member_list.blockSignals(True)
@@ -2548,6 +2580,8 @@ class AllianceMembersTab(QWidget):
         self.member_list.blockSignals(False)
         if activate and self._selected_member_id is not None:
             self._activate_member_by_id(self._selected_member_id)
+        if self.tags_tab is not None:
+            self.tags_tab.handle_members_changed()
 
     def _activate_member_by_id(self, member_id: Optional[str]):
         if member_id is None:
@@ -2785,6 +2819,64 @@ class AllianceMembersTab(QWidget):
         if role_name in member.roles:
             member.roles = [r for r in member.roles if r != role_name]
             self._deferred_select_id = member.member_id
+            self._deferred_activate = False
+            self._refresh_list()
+            window = self.window()
+            if isinstance(window, MainWindow):
+                window.request_autosave()
+
+    def assign_tag(self, member_id: str, tag_name: str):
+        member = self.get_member(member_id)
+        if member is None:
+            return
+        if tag_name in member.tags:
+            return
+        member.tags.append(tag_name)
+        member.tags.sort(key=str.casefold)
+        self._deferred_select_id = member.member_id
+        self._deferred_activate = False
+        self._refresh_list()
+        window = self.window()
+        if isinstance(window, MainWindow):
+            window.request_autosave()
+
+    def unassign_tag(self, member_id: str, tag_name: str):
+        member = self.get_member(member_id)
+        if member is None:
+            return
+        if tag_name not in member.tags:
+            return
+        member.tags = [tag for tag in member.tags if tag != tag_name]
+        self._deferred_select_id = member.member_id
+        self._deferred_activate = False
+        self._refresh_list()
+        window = self.window()
+        if isinstance(window, MainWindow):
+            window.request_autosave()
+
+    def remove_tag(self, tag_name: str):
+        changed = False
+        for member in self.members:
+            if tag_name in member.tags:
+                member.tags = [tag for tag in member.tags if tag != tag_name]
+                changed = True
+        if changed:
+            self._deferred_select_id = self._selected_member_id
+            self._deferred_activate = False
+            self._refresh_list()
+            window = self.window()
+            if isinstance(window, MainWindow):
+                window.request_autosave()
+
+    def rename_tag(self, old_name: str, new_name: str):
+        changed = False
+        for member in self.members:
+            if old_name in member.tags:
+                member.tags = [new_name if tag == old_name else tag for tag in member.tags]
+                member.tags.sort(key=str.casefold)
+                changed = True
+        if changed:
+            self._deferred_select_id = self._selected_member_id
             self._deferred_activate = False
             self._refresh_list()
             window = self.window()
@@ -3124,16 +3216,242 @@ class AllianceRolesTab(QWidget):
         self._refresh_roles()
 
 
+class AllianceTagsTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.members_tab: Optional[AllianceMembersTab] = None
+        self.tags: List[TagRecord] = []
+        self._selected_tag_id: Optional[str] = None
+        self._updating_members = False
+
+        layout = QVBoxLayout(self)
+        content_layout = QHBoxLayout()
+        layout.addLayout(content_layout)
+
+        tag_column = QVBoxLayout()
+        tag_column.addWidget(QLabel("Tags:", self))
+        self.tag_list = QListWidget(self)
+        self.tag_list.setSelectionMode(QListWidget.SingleSelection)
+        self.tag_list.currentItemChanged.connect(self._on_tag_selection_changed)
+        tag_column.addWidget(self.tag_list)
+
+        tag_buttons = QHBoxLayout()
+        add_btn = QPushButton("Add", self)
+        remove_btn = QPushButton("Remove", self)
+        rename_btn = QPushButton("Rename", self)
+        tag_buttons.addWidget(add_btn)
+        tag_buttons.addWidget(remove_btn)
+        tag_buttons.addWidget(rename_btn)
+        tag_column.addLayout(tag_buttons)
+
+        content_layout.addLayout(tag_column, 1)
+
+        member_column = QVBoxLayout()
+        member_column.addWidget(QLabel("Assign to members:", self))
+        self.member_list = QListWidget(self)
+        self.member_list.setAlternatingRowColors(True)
+        self.member_list.itemChanged.connect(self._on_member_item_changed)
+        self.member_list.setEnabled(False)
+        member_column.addWidget(self.member_list)
+        content_layout.addLayout(member_column, 2)
+
+        add_btn.clicked.connect(self._prompt_add_tag)
+        remove_btn.clicked.connect(self._remove_selected_tag)
+        rename_btn.clicked.connect(self._rename_tag)
+
+    def _sort_tags(self) -> None:
+        self.tags.sort(key=lambda record: record.name.casefold())
+
+    def _refresh_tags(self, select_id: Optional[str] = None) -> None:
+        previous = select_id or self._selected_tag_id
+        self.tag_list.blockSignals(True)
+        self.tag_list.clear()
+        selected_item: Optional[QListWidgetItem] = None
+        for record in self.tags:
+            item = QListWidgetItem(record.name)
+            item.setData(Qt.UserRole, record.tag_id)
+            self.tag_list.addItem(item)
+            if previous and record.tag_id == previous:
+                selected_item = item
+        self.tag_list.blockSignals(False)
+        if selected_item is not None:
+            self.tag_list.setCurrentItem(selected_item)
+        elif self.tag_list.count() > 0:
+            self.tag_list.setCurrentRow(0)
+        else:
+            self._selected_tag_id = None
+            self.member_list.clear()
+            self.member_list.setEnabled(False)
+
+    def _find_tag(self, tag_id: Optional[str]) -> Optional[TagRecord]:
+        if tag_id is None:
+            return None
+        for record in self.tags:
+            if record.tag_id == tag_id:
+                return record
+        return None
+
+    def _find_tag_by_name(self, name: str) -> Optional[TagRecord]:
+        lookup = name.casefold()
+        for record in self.tags:
+            if record.name.casefold() == lookup:
+                return record
+        return None
+
+    def _current_tag(self) -> Optional[TagRecord]:
+        return self._find_tag(self._selected_tag_id)
+
+    def _on_tag_selection_changed(self, current: Optional[QListWidgetItem], previous):
+        del previous  # unused
+        tag_id = current.data(Qt.UserRole) if isinstance(current, QListWidgetItem) else None
+        self._selected_tag_id = tag_id if tag_id else None
+        has_selection = self._selected_tag_id is not None
+        self.member_list.setEnabled(has_selection)
+        if has_selection:
+            self._refresh_member_assignments()
+        else:
+            self.member_list.clear()
+
+    def _refresh_member_assignments(self) -> None:
+        record = self._current_tag()
+        if record is None or self.members_tab is None:
+            self.member_list.clear()
+            self.member_list.setEnabled(False)
+            return
+        members = list(self.members_tab.members)
+        members.sort(key=lambda m: (-RANK_ORDER.index(m.rank), m.name.lower()))
+        self._updating_members = True
+        self.member_list.clear()
+        for member in members:
+            text = f"{member.rank} {member.name}"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, member.member_id)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            assigned = record.name in member.tags
+            item.setCheckState(Qt.Checked if assigned else Qt.Unchecked)
+            self.member_list.addItem(item)
+        self._updating_members = False
+
+    def _prompt_add_tag(self) -> None:
+        name, ok = QInputDialog.getText(self, "Add Tag", "Tag name:")
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if self._find_tag_by_name(name) is not None:
+            QMessageBox.information(self, "Tag exists", f"Tag '{name}' already exists.")
+            return
+        record = TagRecord(name)
+        self.tags.append(record)
+        self._sort_tags()
+        self._refresh_tags(select_id=record.tag_id)
+        window = self.window()
+        if isinstance(window, MainWindow):
+            window.request_autosave()
+
+    def _remove_selected_tag(self) -> None:
+        record = self._current_tag()
+        if record is None:
+            return
+        self.tags = [tag for tag in self.tags if tag.tag_id != record.tag_id]
+        if self.members_tab is not None:
+            self.members_tab.remove_tag(record.name)
+        self._refresh_tags()
+        window = self.window()
+        if isinstance(window, MainWindow):
+            window.request_autosave()
+
+    def _rename_tag(self) -> None:
+        record = self._current_tag()
+        if record is None:
+            return
+        new_name, ok = QInputDialog.getText(
+            self, "Rename Tag", "Tag name:", text=record.name
+        )
+        if not ok:
+            return
+        new_name = new_name.strip()
+        if not new_name or new_name == record.name:
+            return
+        if self._find_tag_by_name(new_name) is not None:
+            QMessageBox.information(self, "Tag exists", f"Tag '{new_name}' already exists.")
+            return
+        old_name = record.name
+        record.name = new_name
+        self._sort_tags()
+        self._refresh_tags(select_id=record.tag_id)
+        if self.members_tab is not None:
+            self.members_tab.rename_tag(old_name, new_name)
+        window = self.window()
+        if isinstance(window, MainWindow):
+            window.request_autosave()
+
+    def _on_member_item_changed(self, item: QListWidgetItem) -> None:
+        if self._updating_members:
+            return
+        record = self._current_tag()
+        if record is None or self.members_tab is None:
+            return
+        member_id = item.data(Qt.UserRole)
+        if not member_id:
+            return
+        if item.checkState() == Qt.Checked:
+            self.members_tab.assign_tag(member_id, record.name)
+        else:
+            self.members_tab.unassign_tag(member_id, record.name)
+
+    def handle_members_changed(self) -> None:
+        if self._selected_tag_id is None:
+            return
+        self._refresh_member_assignments()
+
+    def serialized_tags(self) -> list[dict]:
+        return [{"name": record.name, "tag_id": record.tag_id} for record in self.tags]
+
+    def load_serialized_tags(self, tags_data: list[dict]) -> None:
+        if not isinstance(tags_data, list):
+            tags_data = []
+        self.tags = []
+        self._selected_tag_id = None
+        for entry in tags_data:
+            name = str(entry.get("name", "")).strip()
+            if not name:
+                continue
+            tag_id = entry.get("tag_id") or uuid.uuid4().hex
+            self.tags.append(TagRecord(name, tag_id=tag_id))
+        self._sort_tags()
+        self._refresh_tags()
+
+    def ensure_tags_from_members(self, members: Iterable[MemberData]) -> None:
+        existing = {record.name.casefold(): record for record in self.tags}
+        added = False
+        for member in members:
+            for tag in member.tags:
+                key = tag.casefold()
+                if key not in existing:
+                    record = TagRecord(tag)
+                    self.tags.append(record)
+                    existing[key] = record
+                    added = True
+        if added:
+            self._sort_tags()
+            self._refresh_tags()
+
 class AllianceWidget(QTabWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.members_tab = AllianceMembersTab(self)
         self.roles_tab = AllianceRolesTab(self)
+        self.tags_tab = AllianceTagsTab(self)
         self.members_tab.roles_tab = self.roles_tab
+        self.members_tab.tags_tab = self.tags_tab
         self.roles_tab.members_tab = self.members_tab
+        self.tags_tab.members_tab = self.members_tab
         self.roles_tab._refresh_roles()
         self.addTab(self.members_tab, "Members")
         self.addTab(self.roles_tab, "Roles")
+        self.addTab(self.tags_tab, "Tags")
 
 
 # ---------------------------- Palette Tabs ----------------------------
@@ -3729,6 +4047,7 @@ class MainWindow(QMainWindow):
                 "member_id": member.member_id,
                 "rank": member.rank,
                 "roles": list(member.roles),
+                "tags": list(member.tags),
             }
             for member in self.alliance_widget.members_tab.members
         ]
@@ -3749,6 +4068,8 @@ class MainWindow(QMainWindow):
                     "standard": record.standard,
                 }
             )
+
+        tags_data = self.alliance_widget.tags_tab.serialized_tags()
 
         objects_data = []
         for item in self.scene.items():
@@ -3786,7 +4107,7 @@ class MainWindow(QMainWindow):
             )
 
         return {
-            "version": 1,
+            "version": 2,
             "grid": {
                 "cell_size": self.scene.cell_size,
                 "show_grid": self.scene.show_grid,
@@ -3795,6 +4116,7 @@ class MainWindow(QMainWindow):
             "categories": categories,
             "members": members_data,
             "roles": roles_data,
+            "tags": tags_data,
             "objects": objects_data,
             "zones": zones_data,
             "zone_counter": int(getattr(self.scene, "_zone_counter", 0)),
@@ -4153,10 +4475,15 @@ class MainWindow(QMainWindow):
         if self.palette_tabs.count():
             self.palette_tabs.setCurrentIndex(0)
 
+    def _apply_tags_data(self, tags_data: list[dict]):
+        tags_tab = self.alliance_widget.tags_tab
+        tags_tab.load_serialized_tags(tags_data)
+
     def _apply_members_data(self, members_data: list[dict]):
         if not isinstance(members_data, list):
             members_data = []
         members_tab = self.alliance_widget.members_tab
+        tags_tab = self.alliance_widget.tags_tab
         members_tab.members = []
         for entry in members_data:
             member_id = entry.get("member_id") or uuid.uuid4().hex
@@ -4166,7 +4493,13 @@ class MainWindow(QMainWindow):
             roles = entry.get("roles", [])
             if isinstance(roles, list):
                 member.roles = [str(role) for role in roles if isinstance(role, str)]
+                member.roles.sort(key=str.lower)
+            tags = entry.get("tags", [])
+            if isinstance(tags, list):
+                member.tags = [str(tag) for tag in tags if isinstance(tag, str)]
+                member.tags.sort(key=str.casefold)
             members_tab.members.append(member)
+        tags_tab.ensure_tags_from_members(members_tab.members)
         members_tab._selected_member_id = None
         members_tab._deferred_select_id = None
         members_tab._deferred_activate = False
@@ -4284,6 +4617,7 @@ class MainWindow(QMainWindow):
         self._apply_grid_visibility(bool(show_grid))
         self._apply_detail_threshold_value(int(detail_threshold))
 
+        self._apply_tags_data(data.get("tags", []))
         self._apply_members_data(data.get("members", []))
         self._apply_roles_data(data.get("roles", []))
         self._apply_objects_data(data.get("objects", []))
