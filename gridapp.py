@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import sys
 import uuid
 from dataclasses import dataclass, field
@@ -32,7 +31,6 @@ from PySide6.QtCore import (
     QSize,
     Qt,
     Signal,
-    QStandardPaths,
     QTimer,
 )
 from PySide6.QtGui import (
@@ -45,6 +43,7 @@ from PySide6.QtGui import (
     QPen,
     QColor,
     QIcon,
+    QImage,
     QPixmap,
 )
 from PySide6.QtWidgets import (
@@ -655,10 +654,11 @@ class ZoneCoordinateDialog(QDialog):
 
 
 class ExportImageDialog(QDialog):
-    def __init__(self, max_cells: int, parent: Optional[QWidget] = None):
+    def __init__(self, max_cells: int, default_width: int, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setWindowTitle("Export Image")
         self._max_cells = max(1, max_cells)
+        self._default_width = max(1, default_width)
 
         layout = QVBoxLayout(self)
         layout.addWidget(
@@ -667,6 +667,25 @@ class ExportImageDialog(QDialog):
                 self,
             )
         )
+
+        format_row = QHBoxLayout()
+        format_row.addWidget(QLabel("Format:", self))
+        self.format_combo = QComboBox(self)
+        self.format_combo.addItem("SVG (Vector)", userData="svg")
+        self.format_combo.addItem("PNG (Raster)", userData="png")
+        self.format_combo.addItem("JPEG (Raster)", userData="jpg")
+        format_row.addWidget(self.format_combo)
+        layout.addLayout(format_row)
+
+        pixel_row = QHBoxLayout()
+        self.pixel_label = QLabel("Width (px):", self)
+        pixel_row.addWidget(self.pixel_label)
+        self.pixel_spin = QSpinBox(self)
+        self.pixel_spin.setRange(16, 200000)
+        self.pixel_spin.setSingleStep(64)
+        self.pixel_spin.setValue(self._default_width)
+        pixel_row.addWidget(self.pixel_spin)
+        layout.addLayout(pixel_row)
 
         self.mode_group = QButtonGroup(self)
         self.current_view_radio = QRadioButton("Capture current view", self)
@@ -735,11 +754,19 @@ class ExportImageDialog(QDialog):
 
         self.current_view_radio.toggled.connect(self._update_coords_enabled)
         self.coordinates_radio.toggled.connect(self._update_coords_enabled)
+        self.format_combo.currentIndexChanged.connect(self._update_format_controls)
         self._update_coords_enabled()
+        self._update_format_controls()
 
     def _update_coords_enabled(self):
         enabled = self.coordinates_radio.isChecked()
         self.coords_container.setEnabled(enabled)
+
+    def _update_format_controls(self):
+        fmt = self.format_combo.currentData()
+        raster = fmt in {"png", "jpg"}
+        self.pixel_label.setEnabled(raster)
+        self.pixel_spin.setEnabled(raster)
 
     def accept(self) -> None:
         if self.coordinates_radio.isChecked():
@@ -768,10 +795,14 @@ class ExportImageDialog(QDialog):
         else:
             coords = None
             mode = "view"
+        fmt = self.format_combo.currentData() or "svg"
+        raster_width = self.pixel_spin.value() if fmt in {"png", "jpg"} else None
         return {
             "mode": mode,
             "coordinates": coords,
             "rescale_draw_distance": self.rescale_checkbox.isChecked(),
+            "format": fmt,
+            "raster_width": raster_width,
         }
 
 
@@ -3316,9 +3347,23 @@ class MainWindow(QMainWindow):
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.setInterval(750)
         self._autosave_timer.timeout.connect(self._perform_autosave)
+        self._storage_root = Path.cwd()
+        self._save_root = self._storage_root / "saves"
+        self._export_root = self._storage_root / "exports"
+        self._autosave_root = self._storage_root / "autosaves"
+        for directory in (self._save_root, self._export_root, self._autosave_root):
+            directory.mkdir(parents=True, exist_ok=True)
+        self._export_format_dirs: Dict[str, Path] = {
+            "svg": self._export_root / "SVG",
+            "png": self._export_root / "PNG",
+            "jpg": self._export_root / "JPG",
+        }
+        for directory in self._export_format_dirs.values():
+            directory.mkdir(parents=True, exist_ok=True)
         self._autosave_path = self._default_autosave_path()
         self._current_file_path: Optional[Path] = None
-        self._last_directory: Optional[Path] = self._autosave_path.parent
+        self._last_save_directory: Optional[Path] = self._save_root
+        self._last_export_directories: Dict[str, Path] = dict(self._export_format_dirs)
 
         self.setWindowTitle("Last War Survivor — Alliance Map Tool")
         self.resize(1200, 800)
@@ -3682,14 +3727,7 @@ class MainWindow(QMainWindow):
         self._write_state_to_path(self._autosave_path, notify=False)
 
     def _default_autosave_path(self) -> Path:
-        location = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
-        if not location:
-            location = QStandardPaths.writableLocation(QStandardPaths.AppConfigLocation)
-        if not location:
-            location = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
-        if not location:
-            location = os.getcwd()
-        directory = Path(location) / "LastWarSurvivorMap"
+        directory = getattr(self, "_autosave_root", Path.cwd() / "autosaves")
         directory.mkdir(parents=True, exist_ok=True)
         return directory / "autosave.json"
 
@@ -3809,11 +3847,11 @@ class MainWindow(QMainWindow):
         success = self._write_state_to_path(path, notify=True)
         if success:
             self._current_file_path = path
-            self._last_directory = path.parent
+            self._last_save_directory = path.parent
         return success
 
     def save_state_dialog(self):
-        directory = self._last_directory or self._autosave_path.parent
+        directory = self._last_save_directory or self._save_root
         filename, _ = QFileDialog.getSaveFileName(
             self,
             "Save Map",
@@ -3854,6 +3892,7 @@ class MainWindow(QMainWindow):
     def _export_scene_to_svg(
         self, path: Path, source_rect: QRectF, *, rescale_draw_distance: bool
     ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
         generator = QSvgGenerator()
         generator.setFileName(str(path))
         width = max(1, int(math.ceil(source_rect.width())))
@@ -3901,13 +3940,86 @@ class MainWindow(QMainWindow):
                 if enabled:
                     viewport.update()
 
+    def _export_scene_to_image(
+        self,
+        path: Path,
+        source_rect: QRectF,
+        width: int,
+        fmt: str,
+        *,
+        rescale_draw_distance: bool,
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        width = max(1, int(width))
+        source_width = max(1.0, float(source_rect.width()))
+        source_height = max(1.0, float(source_rect.height()))
+        scale = width / source_width
+        height = max(1, int(round(source_height * scale)))
+
+        if fmt == "jpg":
+            image = QImage(width, height, QImage.Format_RGB32)
+            image.fill(Qt.white)
+        else:
+            image = QImage(width, height, QImage.Format_ARGB32_Premultiplied)
+            image.fill(Qt.transparent)
+
+        desired_distance = self.scene.draw_distance_cells
+        if rescale_draw_distance and desired_distance > 0:
+            required = int(
+                math.ceil(max(source_rect.width(), source_rect.height()) / (2 * self.scene.cell_size))
+            )
+            desired_distance = max(desired_distance, required)
+
+        views = list(self.scene.views())
+        viewport_states: list[tuple[QWidget, bool]] = []
+        for view in views:
+            viewport = view.viewport()
+            viewport_states.append((viewport, viewport.updatesEnabled()))
+            viewport.setUpdatesEnabled(False)
+
+        painter = None
+        original_distance = self.scene.draw_distance_cells
+        state: list[tuple[QGraphicsItem, bool, bool]] = []
+        applied = False
+        try:
+            original_distance, state = self.scene.apply_draw_distance_for_rect(
+                source_rect, desired_distance
+            )
+            applied = True
+            painter = QPainter(image)
+            target_rect = QRectF(0, 0, float(width), float(height))
+            self.scene.render(painter, target_rect, source_rect)
+        finally:
+            if painter is not None:
+                painter.end()
+            if applied:
+                self.scene.restore_draw_distance_after_rect(original_distance, state)
+            for viewport, enabled in viewport_states:
+                viewport.setUpdatesEnabled(enabled)
+                if enabled:
+                    viewport.update()
+
+        format_key = "JPG" if fmt == "jpg" else fmt.upper()
+        if not image.save(str(path), format_key):
+            raise RuntimeError("Could not write image file")
+
     def export_image(self):
-        dialog = ExportImageDialog(self.scene.cells, self)
+        view_rect = self.scene.current_view_rect()
+        if view_rect is not None and view_rect.width() > 0:
+            default_width = int(math.ceil(view_rect.width()))
+        else:
+            default_width = int(self.scene.cell_size * max(1, self.scene.cells))
+        dialog = ExportImageDialog(self.scene.cells, default_width, self)
         if dialog.exec() != QDialog.Accepted:
             return
         options = dialog.get_options()
         mode = options.get("mode", "view")
         rescale = bool(options.get("rescale_draw_distance", False))
+        fmt = str(options.get("format", "svg")).lower()
+        if fmt == "jpeg":
+            fmt = "jpg"
+        if fmt not in {"svg", "png", "jpg"}:
+            fmt = "svg"
 
         if mode == "coordinates":
             rect = self._export_rect_from_coordinates(options.get("coordinates"))
@@ -3931,27 +4043,58 @@ class MainWindow(QMainWindow):
             )
             return
 
-        directory = self._last_directory or self._autosave_path.parent
+        target_directory = (
+            self._last_export_directories.get(fmt)
+            or self._export_format_dirs.get(fmt)
+            or self._export_root
+        )
+        target_directory.mkdir(parents=True, exist_ok=True)
+        filter_map = {
+            "svg": "SVG Files (*.svg)",
+            "png": "PNG Files (*.png)",
+            "jpg": "JPEG Files (*.jpg *.jpeg)",
+        }
+        filter_string = filter_map.get(fmt, "All Files (*)") + ";;All Files (*)"
         filename, _ = QFileDialog.getSaveFileName(
             self,
             "Export Grid Image",
-            str(directory),
-            "SVG Files (*.svg);;All Files (*)",
+            str(target_directory),
+            filter_string,
         )
         if not filename:
             return
 
         path = Path(filename)
-        if path.suffix.lower() != ".svg":
-            path = path.with_suffix(".svg")
+        suffix = path.suffix.lower()
+        if fmt == "svg":
+            if suffix != ".svg":
+                path = path.with_suffix(".svg")
+        elif fmt == "png":
+            if suffix != ".png":
+                path = path.with_suffix(".png")
+        else:  # jpg
+            if suffix not in {".jpg", ".jpeg"}:
+                path = path.with_suffix(".jpg")
 
         try:
-            self._export_scene_to_svg(path, rect, rescale_draw_distance=rescale)
+            if fmt == "svg":
+                self._export_scene_to_svg(path, rect, rescale_draw_distance=rescale)
+            else:
+                width = options.get("raster_width")
+                if not width:
+                    width = int(math.ceil(rect.width())) or 1
+                self._export_scene_to_image(
+                    path,
+                    rect,
+                    width,
+                    fmt,
+                    rescale_draw_distance=rescale,
+                )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Export failed", f"Could not export image:\n{exc}")
             return
 
-        self._last_directory = path.parent
+        self._last_export_directories[fmt] = path.parent
         self.statusBar().showMessage(f"Exported image to {path}", 5000)
 
     def load_state_from_path(
@@ -3981,7 +4124,7 @@ class MainWindow(QMainWindow):
         self.scene.update_zone_draw_visuals()
         if not autosave:
             self._current_file_path = path
-        self._last_directory = path.parent
+            self._last_save_directory = path.parent
         if autosave:
             self._autosave_timer.stop()
         else:
@@ -3989,7 +4132,7 @@ class MainWindow(QMainWindow):
         return True
 
     def load_state_dialog(self):
-        directory = self._last_directory or self._autosave_path.parent
+        directory = self._last_save_directory or self._save_root
         filename, _ = QFileDialog.getOpenFileName(
             self,
             "Load Map",
