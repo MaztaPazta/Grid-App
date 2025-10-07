@@ -135,6 +135,7 @@ class MemberData:
     rank: str = "R1"
     roles: List[str] = field(default_factory=list)
     tags: List[str] = field(default_factory=list)
+    nickname: Optional[str] = None
     map_object: Optional["MapObject"] = None
     template_id: str = field(init=False)
 
@@ -143,9 +144,26 @@ class MemberData:
 
     def __post_init__(self):
         self.template_id = f"member:{self.member_id}"
+        if self.nickname:
+            nickname = self.nickname.strip()
+            self.nickname = nickname or None
+
+    def has_nickname(self) -> bool:
+        return bool(self.nickname)
+
+    def display_name(self) -> str:
+        if self.nickname:
+            return f"{self.name} \"{self.nickname}\""
+        return self.name
+
+    def preferred_label(self) -> str:
+        return self.nickname or self.name
+
+    def sort_name(self) -> str:
+        return (self.nickname or self.name)
 
     def display_text(self) -> str:
-        base = f"{self.rank} {self.name}"
+        base = f"{self.rank} {self.display_name()}"
         roles_text = ", ".join(self.roles)
         if roles_text:
             base = f"{base} — {roles_text}"
@@ -174,7 +192,7 @@ class MemberData:
     def placement_spec(self) -> ObjectSpec:
         color = self.rank_color()
         return ObjectSpec(
-            name=self.name,
+            name=self.preferred_label(),
             size_w=3,
             size_h=3,
             fill=color,
@@ -1585,24 +1603,32 @@ class MapScene(QGraphicsScene):
         self.preview_item.setVisible(True)
         self.preview_item.setPos(self._top_left_from_center_snap(scene_pos))
 
+    @staticmethod
+    def _rects_match(rect_a: QRectF, rect_b: QRectF, tol: float = 0.5) -> bool:
+        return (
+            abs(rect_a.left() - rect_b.left()) <= tol
+            and abs(rect_a.top() - rect_b.top()) <= tol
+            and abs(rect_a.width() - rect_b.width()) <= tol
+            and abs(rect_a.height() - rect_b.height()) <= tol
+        )
+
+    def _analyze_overlaps(self, rect: QRectF) -> tuple[bool, list[MapObject]]:
+        exact_matches: list[MapObject] = []
+        for item in self.items():
+            if not isinstance(item, MapObject):
+                continue
+            item_rect = item.bounding_rect_scene()
+            if not rect.intersects(item_rect):
+                continue
+            if self._rects_match(rect, item_rect):
+                exact_matches.append(item)
+            else:
+                return True, []
+        return False, exact_matches
+
     def place_active_at(self, scene_pos: QPointF) -> Optional[QGraphicsItemGroup]:
         if self.active_spec is None:
             return None
-        limit = self.active_spec.limit
-        limit_key = self.active_spec.limit_key or self.active_spec.name
-        if limit is not None:
-            existing_items = self.objects_with_key(limit_key)
-            if limit == 1 and existing_items:
-                for item in existing_items:
-                    self.remove_map_item(item)
-                existing_items = []
-            if len(existing_items) >= limit:
-                QMessageBox.information(
-                    None,
-                    "Limit reached",
-                    f"Cannot place more than {limit} instance(s) of {limit_key}.",
-                )
-                return None
         pos = self._top_left_from_center_snap(scene_pos)
         rect = QRectF(
             pos.x(),
@@ -1610,9 +1636,36 @@ class MapScene(QGraphicsScene):
             self.active_spec.size_w * self.cell_size,
             self.active_spec.size_h * self.cell_size,
         )
-        if not self.is_area_free_for_object(rect):
-            QMessageBox.information(None, "Overlap", "Cannot place object on top of another object.")
+        partial_overlap, exact_matches = self._analyze_overlaps(rect)
+        if partial_overlap:
+            QMessageBox.information(
+                None,
+                "Overlap",
+                "Cannot place object on top of another object.",
+            )
             return None
+
+        limit = self.active_spec.limit
+        limit_key = self.active_spec.limit_key or self.active_spec.name
+        if limit is not None:
+            existing_items = self.objects_with_key(limit_key)
+            if limit == 1 and existing_items:
+                for item in list(existing_items):
+                    if item in exact_matches:
+                        continue
+                    self.remove_map_item(item)
+                existing_items = [item for item in existing_items if item in exact_matches]
+            remaining_count = sum(1 for item in existing_items if item not in exact_matches)
+            if remaining_count >= limit:
+                QMessageBox.information(
+                    None,
+                    "Limit reached",
+                    f"Cannot place more than {limit} instance(s) of {limit_key}.",
+                )
+                return None
+        for item in list(exact_matches):
+            if item.scene() is self:
+                self.remove_map_item(item)
         obj = MapObject(clone_spec(self.active_spec), pos, self.cell_size)
         self.addItem(obj)
         obj.updateLabelLayout()
@@ -2556,7 +2609,9 @@ class AllianceMembersTab(QWidget):
                     filtered_members.append(member)
             filtered = filtered_members
         if self.sort_checkbox.isChecked():
-            filtered.sort(key=lambda m: (-RANK_ORDER.index(m.rank), m.name.lower()))
+            filtered.sort(
+                key=lambda m: (-RANK_ORDER.index(m.rank), m.sort_name().casefold())
+            )
         self.member_list.blockSignals(True)
         self.member_list.clear()
         selected_item: Optional[QListWidgetItem] = None
@@ -2659,19 +2714,7 @@ class AllianceMembersTab(QWidget):
         if not name or name == member.name:
             return
         member.name = name
-        self._update_member_map_object(member)
-        if self.roles_tab is not None:
-            self.roles_tab.handle_member_renamed(member.member_id, member.name)
-        window = self.window()
-        if isinstance(window, MainWindow) and getattr(window, "active_member", None) is member:
-            self._deferred_activate = True
-        else:
-            self._deferred_activate = False
-        self._deferred_select_id = member.member_id
-        self._refresh_list()
-        window = self.window()
-        if isinstance(window, MainWindow):
-            window.request_autosave()
+        self._handle_member_identity_change(member)
 
     def _on_member_clicked(self, item: QListWidgetItem):
         member = self._member_from_item(item)
@@ -2686,6 +2729,12 @@ class AllianceMembersTab(QWidget):
         if member is None:
             return
         menu = QMenu(self)
+        nickname_action = menu.addAction("Set Nickname…")
+        clear_nickname_action = None
+        if member.has_nickname():
+            clear_nickname_action = menu.addAction("Clear Nickname")
+        if menu.actions():
+            menu.addSeparator()
         actions = []
         for rank in RANK_ORDER:
             action = menu.addAction(rank)
@@ -2695,6 +2744,12 @@ class AllianceMembersTab(QWidget):
             actions.append(action)
         chosen = menu.exec(self.member_list.mapToGlobal(point))
         if chosen is None:
+            return
+        if chosen == nickname_action:
+            self._prompt_member_nickname(member)
+            return
+        if clear_nickname_action is not None and chosen == clear_nickname_action:
+            self._apply_member_nickname(member, None)
             return
         rank = chosen.data()
         if rank:
@@ -2754,12 +2809,49 @@ class AllianceMembersTab(QWidget):
             return
         color = member.rank_color()
         obj = member.map_object
-        obj.spec.name = member.name
-        obj.label_item.setText(member.name)
+        label = member.preferred_label()
+        obj.spec.name = label
+        obj.label_item.setText(label)
         obj.updateLabelLayout()
         obj.spec.fill = QColor(color)
         obj.rect_item.setBrush(QBrush(obj.spec.fill))
         obj._last_valid_pos = QPointF(obj.pos())
+
+    def _handle_member_identity_change(self, member: MemberData):
+        self._update_member_map_object(member)
+        if self.roles_tab is not None:
+            self.roles_tab.handle_member_renamed(member.member_id, member.display_name())
+        window = self.window()
+        if isinstance(window, MainWindow) and getattr(window, "active_member", None) is member:
+            self._deferred_activate = True
+        else:
+            self._deferred_activate = False
+        self._deferred_select_id = member.member_id
+        self._refresh_list()
+        if isinstance(window, MainWindow):
+            window.request_autosave()
+
+    def _prompt_member_nickname(self, member: MemberData):
+        initial = member.nickname or ""
+        nickname, ok = QInputDialog.getText(
+            self,
+            "Set Nickname",
+            "Enter nickname (leave blank to remove):",
+            text=initial,
+        )
+        if not ok:
+            return
+        nickname = nickname.strip()
+        self._apply_member_nickname(member, nickname or None)
+
+    def _apply_member_nickname(self, member: MemberData, nickname: Optional[str]):
+        normalized = nickname.strip() if isinstance(nickname, str) else None
+        if not normalized:
+            normalized = None
+        if member.nickname == normalized:
+            return
+        member.nickname = normalized
+        self._handle_member_identity_change(member)
 
     def _on_rank_spec_changed(self, rank: str):
         for member in self.members:
@@ -2966,7 +3058,7 @@ class RoleAssignmentDialog(QDialog):
         self.list_widget.addItem(vacancy_item)
         default_row = 0
         for member in members:
-            item = QListWidgetItem(f"{member.rank} {member.name}")
+            item = QListWidgetItem(f"{member.rank} {member.display_name()}")
             item.setData(Qt.UserRole, member.member_id)
             self.list_widget.addItem(item)
             if current_member_id and member.member_id == current_member_id:
@@ -3063,7 +3155,7 @@ class AllianceRolesTab(QWidget):
         if record.member_id and self.members_tab is not None:
             member = self.members_tab.get_member(record.member_id)
             if member is not None:
-                member_name = member.name
+                member_name = member.display_name()
         if member_name:
             return f"{record.name} — {member_name}"
         return f"{record.name} (vacant)"
@@ -3201,7 +3293,7 @@ class AllianceRolesTab(QWidget):
                 QMessageBox.information(
                     self,
                     "Role unassigned",
-                    f"{member.name} no longer meets the rank requirements for: {', '.join(removed_roles)}.",
+                    f"{member.display_name()} no longer meets the rank requirements for: {', '.join(removed_roles)}.",
                 )
             self._refresh_roles()
             window = self.window()
@@ -3319,11 +3411,11 @@ class AllianceTagsTab(QWidget):
             self.member_list.setEnabled(False)
             return
         members = list(self.members_tab.members)
-        members.sort(key=lambda m: (-RANK_ORDER.index(m.rank), m.name.lower()))
+        members.sort(key=lambda m: (-RANK_ORDER.index(m.rank), m.sort_name().casefold()))
         self._updating_members = True
         self.member_list.clear()
         for member in members:
-            text = f"{member.rank} {member.name}"
+            text = f"{member.rank} {member.display_name()}"
             item = QListWidgetItem(text)
             item.setData(Qt.UserRole, member.member_id)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
@@ -3547,6 +3639,7 @@ class PaletteTabWidget(QTabWidget):
         window = self.window()
         if isinstance(window, MainWindow):
             window.request_autosave()
+            window.activate_placement(spec)
 
     def _prompt_new_object(self):
         index = self.currentIndex()
@@ -3779,7 +3872,7 @@ class MainWindow(QMainWindow):
         self.activate_placement(spec, clear_member=False)
         self.active_member = member
         self.hint_label.setText(
-            f"Placing {member.name} ({member.rank}): Left-click to place, Right-click to cancel"
+            f"Placing {member.display_name()} ({member.rank}): Left-click to place, Right-click to cancel"
         )
 
     def set_zone_draw_mode(self, enabled: bool):
@@ -4048,6 +4141,7 @@ class MainWindow(QMainWindow):
                 "rank": member.rank,
                 "roles": list(member.roles),
                 "tags": list(member.tags),
+                "nickname": member.nickname,
             }
             for member in self.alliance_widget.members_tab.members
         ]
@@ -4489,7 +4583,14 @@ class MainWindow(QMainWindow):
             member_id = entry.get("member_id") or uuid.uuid4().hex
             name = entry.get("name", "")
             rank = entry.get("rank", "R1")
-            member = MemberData(name=name, member_id=member_id, rank=rank)
+            nickname = entry.get("nickname")
+            nickname_value = nickname.strip() if isinstance(nickname, str) else None
+            member = MemberData(
+                name=name,
+                member_id=member_id,
+                rank=rank,
+                nickname=nickname_value,
+            )
             roles = entry.get("roles", [])
             if isinstance(roles, list):
                 member.roles = [str(role) for role in roles if isinstance(role, str)]
