@@ -15,10 +15,13 @@
 # - Start: `python app.py`
 from __future__ import annotations
 
+import json
 import math
+import os
 import sys
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, ClassVar, Dict, Iterable, List, Optional, Set
 
 from PySide6.QtCore import (
@@ -29,6 +32,8 @@ from PySide6.QtCore import (
     QSize,
     Qt,
     Signal,
+    QStandardPaths,
+    QTimer,
 )
 from PySide6.QtGui import (
     QAction,
@@ -73,6 +78,7 @@ from PySide6.QtWidgets import (
     QGraphicsSimpleTextItem,
     QGraphicsView,
     QInputDialog,
+    QFileDialog,
 )
 
 
@@ -228,6 +234,19 @@ def clone_spec(spec: ObjectSpec) -> ObjectSpec:
         spec.limit_key,
         spec.template_id,
     )
+
+
+# ----------------------------- Persistence -----------------------------
+def color_to_hex(color: QColor) -> str:
+    return QColor(color).name(QColor.HexArgb)
+
+
+def color_from_hex(value: Optional[str], fallback: QColor) -> QColor:
+    if isinstance(value, str):
+        color = QColor(value)
+        if color.isValid():
+            return color
+    return QColor(fallback)
 
 
 # ----------------------------- UI Helpers ------------------------------
@@ -1735,6 +1754,9 @@ class PaletteList(QListWidget):
             self.specs.append(spec)
         item = self._create_item(spec)
         self.addItem(item)
+        window = self.window()
+        if isinstance(window, MainWindow):
+            window.request_autosave()
         return item
 
     def find_spec_by_name(self, name: str) -> Optional[ObjectSpec]:
@@ -1795,6 +1817,8 @@ class PaletteList(QListWidget):
             if changed:
                 w.offer_apply_spec_changes(spec, previous)
             w.refresh_active_preview_if(spec)
+            if changed:
+                w.request_autosave()
         if changed:
             self._notify_spec_changed(spec, previous)
 
@@ -2249,6 +2273,9 @@ class AllianceMembersTab(QWidget):
         self._deferred_select_id = member.member_id
         self._deferred_activate = True
         self._refresh_list()
+        window = self.window()
+        if isinstance(window, MainWindow):
+            window.request_autosave()
 
     def _remove_member_by_id(self, member_id: str):
         member = self.get_member(member_id)
@@ -2263,6 +2290,9 @@ class AllianceMembersTab(QWidget):
         if self.roles_tab is not None:
             self.roles_tab.handle_member_removed(member.member_id)
         self.members = [m for m in self.members if m.member_id != member.member_id]
+        window = self.window()
+        if isinstance(window, MainWindow):
+            window.request_autosave()
 
     def _remove_selected(self):
         selected_ids = [item.data(Qt.UserRole) for item in self.member_list.selectedItems()]
@@ -2270,6 +2300,9 @@ class AllianceMembersTab(QWidget):
             if member_id:
                 self._remove_member_by_id(member_id)
         self._refresh_list()
+        window = self.window()
+        if isinstance(window, MainWindow):
+            window.request_autosave()
 
     def _member_from_item(self, item: Optional[QListWidgetItem]) -> Optional[MemberData]:
         if item is None:
@@ -2298,6 +2331,9 @@ class AllianceMembersTab(QWidget):
             self._deferred_activate = False
         self._deferred_select_id = member.member_id
         self._refresh_list()
+        window = self.window()
+        if isinstance(window, MainWindow):
+            window.request_autosave()
 
     def _on_member_clicked(self, item: QListWidgetItem):
         member = self._member_from_item(item)
@@ -2371,6 +2407,9 @@ class AllianceMembersTab(QWidget):
             self.roles_tab.handle_member_rank_changed(member.member_id, rank)
         self._deferred_select_id = member.member_id
         self._refresh_list()
+        window = self.window()
+        if isinstance(window, MainWindow):
+            window.request_autosave()
 
     def _update_member_map_object(self, member: MemberData):
         if member.map_object is None:
@@ -2431,6 +2470,9 @@ class AllianceMembersTab(QWidget):
             self._deferred_select_id = member.member_id
             self._deferred_activate = False
             self._refresh_list()
+            window = self.window()
+            if isinstance(window, MainWindow):
+                window.request_autosave()
 
     def unassign_role(self, member_id: str, role_name: str):
         member = self.get_member(member_id)
@@ -2441,6 +2483,9 @@ class AllianceMembersTab(QWidget):
             self._deferred_select_id = member.member_id
             self._deferred_activate = False
             self._refresh_list()
+            window = self.window()
+            if isinstance(window, MainWindow):
+                window.request_autosave()
 
     def rename_role(self, old_name: str, new_name: str):
         changed = False
@@ -2451,6 +2496,9 @@ class AllianceMembersTab(QWidget):
                 changed = True
         if changed:
             self._refresh_list()
+            window = self.window()
+            if isinstance(window, MainWindow):
+                window.request_autosave()
 
     def remove_role_name(self, role_name: str):
         changed = False
@@ -2460,6 +2508,9 @@ class AllianceMembersTab(QWidget):
                 changed = True
         if changed:
             self._refresh_list()
+            window = self.window()
+            if isinstance(window, MainWindow):
+                window.request_autosave()
 
     def eligible_members(self, allowed_ranks: Optional[Set[str]]) -> List[MemberData]:
         if allowed_ranks is None:
@@ -2566,10 +2617,7 @@ class AllianceRolesTab(QWidget):
         remove_btn.clicked.connect(self._remove_selected)
         assign_btn.clicked.connect(self._prompt_assign_member)
 
-        for role_name in ["Warlord", "Recruiter", "Muse", "Butler"]:
-            self._add_role_record(
-                RoleRecord(role_name, allowed_ranks={"R4"}, standard=True)
-            )
+        self.reset_roles()
 
     def _on_item_double_clicked(self, item: QListWidgetItem):
         role = self._role_from_item(item)
@@ -2627,6 +2675,9 @@ class AllianceRolesTab(QWidget):
     def _add_role_record(self, record: RoleRecord):
         self.roles.append(record)
         self._refresh_roles(select_id=record.role_id)
+        window = self.window()
+        if isinstance(window, MainWindow):
+            window.request_autosave()
 
     def _prompt_add_role(self):
         dialog = RoleConfigDialog(self)
@@ -2661,6 +2712,9 @@ class AllianceRolesTab(QWidget):
         if self.members_tab is not None:
             self.members_tab.rename_role(old_name, new_name)
         self._refresh_roles(select_id=record.role_id)
+        window = self.window()
+        if isinstance(window, MainWindow):
+            window.request_autosave()
 
     def _remove_selected(self):
         selected_ids = [item.data(Qt.UserRole) for item in self.role_list.selectedItems()]
@@ -2677,6 +2731,9 @@ class AllianceRolesTab(QWidget):
             updated = True
         if updated:
             self._refresh_roles()
+            window = self.window()
+            if isinstance(window, MainWindow):
+                window.request_autosave()
 
     def _prompt_assign_member(self):
         record = self._current_role()
@@ -2712,6 +2769,9 @@ class AllianceRolesTab(QWidget):
         if selected_member_id and self.members_tab is not None:
             self.members_tab.assign_role(selected_member_id, record.name)
         self._refresh_roles(select_id=record.role_id)
+        window = self.window()
+        if isinstance(window, MainWindow):
+            window.request_autosave()
 
     def handle_member_removed(self, member_id: str):
         updated = False
@@ -2721,6 +2781,9 @@ class AllianceRolesTab(QWidget):
                 updated = True
         if updated:
             self._refresh_roles()
+            window = self.window()
+            if isinstance(window, MainWindow):
+                window.request_autosave()
 
     def handle_member_renamed(self, member_id: str, new_name: str):
         if any(record.member_id == member_id for record in self.roles):
@@ -2745,6 +2808,16 @@ class AllianceRolesTab(QWidget):
                     f"{member.name} no longer meets the rank requirements for: {', '.join(removed_roles)}.",
                 )
             self._refresh_roles()
+            window = self.window()
+            if isinstance(window, MainWindow):
+                window.request_autosave()
+
+    def reset_roles(self):
+        self.roles = []
+        for role_name in ["Warlord", "Recruiter", "Muse", "Butler"]:
+            record = RoleRecord(role_name, allowed_ranks={"R4"}, standard=True)
+            self.roles.append(record)
+        self._refresh_roles()
 
 
 class AllianceWidget(QTabWidget):
@@ -2835,6 +2908,9 @@ class PaletteTabWidget(QTabWidget):
             specs = []
         list_widget = PaletteList(specs, self)
         self.addTab(list_widget, name)
+        window = self.window()
+        if isinstance(window, MainWindow):
+            window.request_autosave()
         return list_widget
 
     def add_object_to_tab(self, tab_index: int, spec: ObjectSpec) -> None:
@@ -2846,6 +2922,9 @@ class PaletteTabWidget(QTabWidget):
         item = widget.add_spec(spec)
         widget.setCurrentItem(item)
         widget.scrollToItem(item)
+        window = self.window()
+        if isinstance(window, MainWindow):
+            window.request_autosave()
 
     def _prompt_new_object(self):
         index = self.currentIndex()
@@ -2915,6 +2994,9 @@ class PaletteTabWidget(QTabWidget):
             QMessageBox.information(self, "Category exists", f"Category '{name}' already exists.")
             return
         self.setTabText(index, name)
+        window = self.window()
+        if isinstance(window, MainWindow):
+            window.request_autosave()
 
     def _category_exists(self, name: str) -> bool:
         for i in range(self.count()):
@@ -2927,8 +3009,35 @@ class PaletteTabWidget(QTabWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self._loading_state = True
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(750)
+        self._autosave_timer.timeout.connect(self._perform_autosave)
+        self._autosave_path = self._default_autosave_path()
+        self._current_file_path: Optional[Path] = None
+        self._last_directory: Optional[Path] = self._autosave_path.parent
+
         self.setWindowTitle("Last War Survivor — Alliance Map Tool")
         self.resize(1200, 800)
+
+        file_menu = self.menuBar().addMenu("&File")
+        self.act_load_file = QAction("Load...", self)
+        self.act_load_file.triggered.connect(self.load_state_dialog)
+        file_menu.addAction(self.act_load_file)
+
+        self.act_save_file = QAction("Save...", self)
+        self.act_save_file.triggered.connect(self.save_state_dialog)
+        file_menu.addAction(self.act_save_file)
+
+        self.act_load_autosave = QAction("Load Autosave", self)
+        self.act_load_autosave.triggered.connect(self._load_autosave_from_menu)
+        file_menu.addAction(self.act_load_autosave)
+
+        file_menu.addSeparator()
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
 
         # Scene & View
         self.scene = MapScene(GRID_CELLS, CELL_SIZE, self)
@@ -3002,12 +3111,17 @@ class MainWindow(QMainWindow):
         self.panel_toolbar.addAction(zone_action)
         self.panel_toolbar.addAction(alliance_action)
 
-        self.scene.zone_created.connect(self.zone_list.add_zone)
-        self.scene.zone_updated.connect(self.zone_list.update_zone_item)
-        self.scene.zone_removed.connect(self.zone_list.remove_zone)
+        self.scene.zone_created.connect(self._handle_zone_created)
+        self.scene.zone_updated.connect(self._handle_zone_updated)
+        self.scene.zone_removed.connect(self._handle_zone_removed)
         self.scene.zone_redraw_finished.connect(self._on_zone_redraw_finished)
         self.scene.object_placed.connect(self._on_object_placed)
         self.scene.object_removed.connect(self._on_object_removed)
+        self.scene.changed.connect(self._on_scene_changed)
+
+        self._load_autosave()
+        self._loading_state = False
+        self._perform_autosave()
 
     def activate_placement(self, spec: ObjectSpec, clear_member: bool = True):
         if clear_member:
@@ -3063,6 +3177,18 @@ class MainWindow(QMainWindow):
             "Redraw zone: Click and drag to define the new area. Right-click to cancel."
         )
 
+    def _handle_zone_created(self, zone: MapZone):
+        self.zone_list.add_zone(zone)
+        self.request_autosave()
+
+    def _handle_zone_updated(self, zone: MapZone):
+        self.zone_list.update_zone_item(zone)
+        self.request_autosave()
+
+    def _handle_zone_removed(self, zone: MapZone):
+        self.zone_list.remove_zone(zone)
+        self.request_autosave()
+
     def _on_zone_redraw_finished(self, zone: MapZone):
         self.set_zone_draw_mode(False)
         zone.setSelected(True)
@@ -3078,11 +3204,13 @@ class MainWindow(QMainWindow):
         template_id = getattr(obj.spec, "template_id", "")
         if template_id and template_id.startswith("member:"):
             self.alliance_widget.members_tab.handle_member_object_placed(template_id, obj)
+        self.request_autosave()
 
     def _on_object_removed(self, obj: MapObject):
         template_id = getattr(obj.spec, "template_id", "")
         if template_id and template_id.startswith("member:"):
             self.alliance_widget.members_tab.handle_member_object_removed(template_id)
+        self.request_autosave()
 
     def offer_apply_spec_changes(self, spec: ObjectSpec, previous: dict):
         matching: list[MapObject] = []
@@ -3166,6 +3294,7 @@ class MainWindow(QMainWindow):
             self.scene.grid_item.setVisible(checked)
             self.scene.grid_item.update()
         self.scene.update()
+        self.request_autosave()
 
     def change_cell_size(self, v: int):
         # Rescale scene: update cell size, scene rect, and items
@@ -3205,6 +3334,425 @@ class MainWindow(QMainWindow):
                 item.update_for_cell_size(v)
         self.scene.update()
         self.scene.update_zone_draw_visuals()
+        self.request_autosave()
+
+    def request_autosave(self):
+        if self._loading_state:
+            return
+        if self._autosave_timer.isActive():
+            self._autosave_timer.stop()
+        self._autosave_timer.start()
+
+    def _perform_autosave(self):
+        if self._loading_state:
+            return
+        self._write_state_to_path(self._autosave_path, notify=False)
+
+    def _default_autosave_path(self) -> Path:
+        location = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
+        if not location:
+            location = QStandardPaths.writableLocation(QStandardPaths.AppConfigLocation)
+        if not location:
+            location = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
+        if not location:
+            location = os.getcwd()
+        directory = Path(location) / "LastWarSurvivorMap"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / "autosave.json"
+
+    def _serialize_state(self) -> dict:
+        categories: list[dict] = []
+        for index in range(self.palette_tabs.count()):
+            widget = self.palette_tabs.widget(index)
+            if not isinstance(widget, PaletteList):
+                continue
+            specs_data: list[dict] = []
+            for spec in widget.specs:
+                specs_data.append(
+                    {
+                        "template_id": spec.template_id,
+                        "name": spec.name,
+                        "size_w": spec.size_w,
+                        "size_h": spec.size_h,
+                        "fill": color_to_hex(spec.fill),
+                        "limit": spec.limit,
+                        "limit_key": spec.limit_key,
+                    }
+                )
+            categories.append({"name": self.palette_tabs.tabText(index), "specs": specs_data})
+
+        members_data = [
+            {
+                "name": member.name,
+                "member_id": member.member_id,
+                "rank": member.rank,
+                "roles": list(member.roles),
+            }
+            for member in self.alliance_widget.members_tab.members
+        ]
+
+        roles_data = []
+        for record in self.alliance_widget.roles_tab.roles:
+            allowed = (
+                sorted(record.allowed_ranks)
+                if isinstance(record.allowed_ranks, set)
+                else record.allowed_ranks
+            )
+            roles_data.append(
+                {
+                    "name": record.name,
+                    "role_id": record.role_id,
+                    "member_id": record.member_id,
+                    "allowed_ranks": list(allowed) if allowed is not None else None,
+                    "standard": record.standard,
+                }
+            )
+
+        objects_data = []
+        for item in self.scene.items():
+            if not isinstance(item, MapObject):
+                continue
+            spec = item.spec
+            objects_data.append(
+                {
+                    "spec": {
+                        "template_id": spec.template_id,
+                        "name": spec.name,
+                        "size_w": spec.size_w,
+                        "size_h": spec.size_h,
+                        "fill": color_to_hex(spec.fill),
+                        "limit": spec.limit,
+                        "limit_key": spec.limit_key,
+                    },
+                    "pos": [float(item.pos().x()), float(item.pos().y())],
+                }
+            )
+
+        zones_data = []
+        for zone in list(getattr(self.scene, "_zones", [])):
+            zones_data.append(
+                {
+                    "spec": {
+                        "name": zone.spec.name,
+                        "size_w": zone.spec.size_w,
+                        "size_h": zone.spec.size_h,
+                        "fill": color_to_hex(zone.spec.fill),
+                        "edge": color_to_hex(zone.spec.edge),
+                    },
+                    "pos": [float(zone.pos().x()), float(zone.pos().y())],
+                }
+            )
+
+        return {
+            "version": 1,
+            "grid": {
+                "cell_size": self.scene.cell_size,
+                "show_grid": self.scene.show_grid,
+            },
+            "categories": categories,
+            "members": members_data,
+            "roles": roles_data,
+            "objects": objects_data,
+            "zones": zones_data,
+            "zone_counter": int(getattr(self.scene, "_zone_counter", 0)),
+            "cells": self.scene.cells,
+        }
+
+    def _write_state_to_path(self, path: Path, *, notify: bool) -> bool:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as handle:
+                json.dump(self._serialize_state(), handle, indent=2)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            if notify:
+                QMessageBox.critical(self, "Save failed", f"Could not save file:\n{exc}")
+            else:
+                print(f"Autosave failed: {exc}", file=sys.stderr)
+            return False
+
+    def save_state_to_path(self, path: Path) -> bool:
+        success = self._write_state_to_path(path, notify=True)
+        if success:
+            self._current_file_path = path
+            self._last_directory = path.parent
+        return success
+
+    def save_state_dialog(self):
+        directory = self._last_directory or self._autosave_path.parent
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Map",
+            str(directory),
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not filename:
+            return
+        path = Path(filename)
+        if path.suffix.lower() != ".json":
+            path = path.with_suffix(".json")
+        if self.save_state_to_path(path):
+            self._perform_autosave()
+
+    def load_state_from_path(
+        self,
+        path: Path,
+        *,
+        notify: bool = True,
+        autosave: bool = False,
+    ) -> bool:
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception as exc:  # noqa: BLE001
+            if notify:
+                QMessageBox.critical(self, "Load failed", f"Could not load file:\n{exc}")
+            return False
+
+        previous_state = self._loading_state
+        self._loading_state = True
+        self._autosave_timer.stop()
+        try:
+            self._apply_state(data)
+        finally:
+            self._loading_state = previous_state
+
+        self.scene.update()
+        self.scene.update_zone_draw_visuals()
+        if not autosave:
+            self._current_file_path = path
+        self._last_directory = path.parent
+        if autosave:
+            self._autosave_timer.stop()
+        else:
+            self.request_autosave()
+        return True
+
+    def load_state_dialog(self):
+        directory = self._last_directory or self._autosave_path.parent
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Map",
+            str(directory),
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not filename:
+            return
+        path = Path(filename)
+        if self.load_state_from_path(path, notify=True):
+            self._current_file_path = path
+
+    def _load_autosave(self, show_message: bool = False):
+        if not self._autosave_path.exists():
+            MemberData.clear_rank_color_cache()
+            for rank in RANK_ORDER:
+                color = self.palette_tabs.rank_template_color(rank)
+                MemberData.update_rank_color_cache(rank, color)
+            return
+        self.load_state_from_path(self._autosave_path, notify=show_message, autosave=True)
+
+    def _load_autosave_from_menu(self):
+        self._load_autosave(show_message=True)
+
+    def _clear_scene_items(self):
+        for item in list(self.scene.items()):
+            if isinstance(item, (MapObject, MapZone)):
+                self.scene.remove_map_item(item)
+
+    def _clear_palette_tabs(self):
+        while self.palette_tabs.count():
+            widget = self.palette_tabs.widget(0)
+            self.palette_tabs.removeTab(0)
+            if widget is not None:
+                widget.deleteLater()
+
+    def _apply_cell_size_value(self, cell_size: int):
+        cell_size = int(max(self.spin_cell.minimum(), min(self.spin_cell.maximum(), cell_size)))
+        previous = self.spin_cell.blockSignals(True)
+        self.spin_cell.setValue(cell_size)
+        self.spin_cell.blockSignals(previous)
+        self.change_cell_size(cell_size)
+
+    def _apply_grid_visibility(self, visible: bool):
+        previous = self.act_toggle_grid.blockSignals(True)
+        self.act_toggle_grid.setChecked(visible)
+        self.act_toggle_grid.blockSignals(previous)
+        self.toggle_grid(visible)
+
+    def _create_spec_from_serialized(self, data: dict) -> ObjectSpec:
+        fill = color_from_hex(data.get("fill"), QColor(Qt.lightGray))
+        limit = data.get("limit")
+        if isinstance(limit, str):
+            try:
+                limit_value = int(limit)
+            except ValueError:
+                limit_value = None
+        else:
+            limit_value = int(limit) if isinstance(limit, (int, float)) else None
+        limit_key = data.get("limit_key")
+        if isinstance(limit_key, str) and not limit_key:
+            limit_key = None
+        template_id = data.get("template_id") or uuid.uuid4().hex
+        return ObjectSpec(
+            data.get("name", "Object"),
+            int(data.get("size_w", 1)),
+            int(data.get("size_h", 1)),
+            fill,
+            limit_value,
+            limit_key,
+            template_id,
+        )
+
+    def _apply_palette_data(self, categories_data: Optional[list]):
+        self._clear_palette_tabs()
+        if not categories_data:
+            for name, specs in DEFAULT_CATEGORIES.items():
+                clones = [clone_spec(spec) for spec in specs]
+                self.palette_tabs.add_category(name, clones)
+        else:
+            for category in categories_data:
+                name = category.get("name", "Category")
+                specs_raw = category.get("specs", [])
+                specs = [self._create_spec_from_serialized(spec) for spec in specs_raw]
+                self.palette_tabs.add_category(name, specs)
+        if self.palette_tabs.count():
+            self.palette_tabs.setCurrentIndex(0)
+
+    def _apply_members_data(self, members_data: list[dict]):
+        if not isinstance(members_data, list):
+            members_data = []
+        members_tab = self.alliance_widget.members_tab
+        members_tab.members = []
+        for entry in members_data:
+            member_id = entry.get("member_id") or uuid.uuid4().hex
+            name = entry.get("name", "")
+            rank = entry.get("rank", "R1")
+            member = MemberData(name=name, member_id=member_id, rank=rank)
+            roles = entry.get("roles", [])
+            if isinstance(roles, list):
+                member.roles = [str(role) for role in roles if isinstance(role, str)]
+            members_tab.members.append(member)
+        members_tab._selected_member_id = None
+        members_tab._deferred_select_id = None
+        members_tab._deferred_activate = False
+        members_tab._refresh_list()
+
+    def _apply_roles_data(self, roles_data: list[dict]):
+        if not isinstance(roles_data, list):
+            roles_data = []
+        roles_tab = self.alliance_widget.roles_tab
+        roles_tab.roles = []
+        roles_tab._selected_role_id = None
+        roles_tab.role_list.clear()
+        if not roles_data:
+            roles_tab.reset_roles()
+            return
+        for entry in roles_data:
+            allowed_raw = entry.get("allowed_ranks")
+            allowed = None
+            if isinstance(allowed_raw, list):
+                allowed = {str(rank) for rank in allowed_raw}
+            record = RoleRecord(
+                entry.get("name", "Role"),
+                role_id=entry.get("role_id", uuid.uuid4().hex),
+                member_id=entry.get("member_id"),
+                allowed_ranks=allowed,
+                standard=bool(entry.get("standard", False)),
+            )
+            roles_tab.roles.append(record)
+        roles_tab._refresh_roles()
+
+    def _apply_objects_data(self, objects_data: list[dict]):
+        if not isinstance(objects_data, list):
+            objects_data = []
+        members_tab = self.alliance_widget.members_tab
+        for entry in objects_data:
+            spec_info = entry.get("spec", {})
+            spec = self._create_spec_from_serialized(spec_info)
+            pos = entry.get("pos", [0, 0])
+            try:
+                x = float(pos[0])
+                y = float(pos[1])
+            except (TypeError, ValueError, IndexError):
+                x, y = 0.0, 0.0
+            top_left = QPointF(x, y)
+            obj = MapObject(spec, top_left, self.scene.cell_size)
+            self.scene.addItem(obj)
+            obj.setPos(top_left)
+            obj.updateLabelLayout()
+            obj._last_valid_pos = QPointF(obj.pos())
+            template_id = getattr(spec, "template_id", "")
+            if template_id and template_id.startswith("member:"):
+                members_tab.handle_member_object_placed(template_id, obj)
+
+    def _apply_zones_data(self, zones_data: list[dict], zone_counter: Optional[int]):
+        self.scene._zones = []
+        self.zone_list.clear()
+        if not isinstance(zones_data, list):
+            self.scene._zone_counter = int(zone_counter or 0)
+            return
+        for entry in zones_data:
+            spec_info = entry.get("spec", {})
+            fill = color_from_hex(spec_info.get("fill"), QColor(DEFAULT_ZONE_FILL))
+            edge = color_from_hex(spec_info.get("edge"), QColor(DEFAULT_ZONE_EDGE))
+            name = spec_info.get("name", f"Zone {len(self.scene._zones) + 1}")
+            spec = ZoneSpec(
+                name,
+                int(spec_info.get("size_w", 1)),
+                int(spec_info.get("size_h", 1)),
+                fill,
+                edge,
+            )
+            pos = entry.get("pos", [0, 0])
+            try:
+                x = float(pos[0])
+                y = float(pos[1])
+            except (TypeError, ValueError, IndexError):
+                x, y = 0.0, 0.0
+            top_left = QPointF(x, y)
+            zone = MapZone(spec, top_left, self.scene.cell_size)
+            self.scene.addItem(zone)
+            zone.setPos(top_left)
+            zone.updateLabelLayout()
+            zone._update_handles_geometry()
+            self.scene._zones.append(zone)
+            self.zone_list.add_zone(zone)
+        counter = 0
+        try:
+            counter = int(zone_counter) if zone_counter is not None else 0
+        except (TypeError, ValueError):
+            counter = 0
+        counter = max(counter, len(self.scene._zones))
+        self.scene._zone_counter = counter
+
+    def _apply_state(self, data: dict):
+        self.cancel_active_placement()
+        self._clear_scene_items()
+
+        grid_data = data.get("grid", {})
+        cell_size = grid_data.get("cell_size", self.scene.cell_size)
+        show_grid = grid_data.get("show_grid", True)
+
+        self._apply_palette_data(data.get("categories"))
+        MemberData.clear_rank_color_cache()
+        for rank in RANK_ORDER:
+            color = self.palette_tabs.rank_template_color(rank)
+            MemberData.update_rank_color_cache(rank, color)
+
+        self._apply_cell_size_value(int(cell_size))
+        self._apply_grid_visibility(bool(show_grid))
+
+        self._apply_members_data(data.get("members", []))
+        self._apply_roles_data(data.get("roles", []))
+        self._apply_objects_data(data.get("objects", []))
+        self._apply_zones_data(data.get("zones", []), data.get("zone_counter"))
+
+    def _on_scene_changed(self, *args):  # noqa: ARG002
+        self.request_autosave()
+
+    def closeEvent(self, event):
+        self._perform_autosave()
+        super().closeEvent(event)
 
     def eventFilter(self, watched, event):
         # Show bottom-left-origin coordinates under cursor and drive preview visibility/position
