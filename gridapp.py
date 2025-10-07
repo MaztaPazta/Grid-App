@@ -8,7 +8,7 @@
 # - Replaced deprecated `.pos()` with `.position()`.
 # - Objects & preview are **above** the grid; placement is **centered under cursor**.
 # - Status coordinates use **0,0 at bottom-left**.
-# - Double-click items in **Objects** to edit **default name** & **color**.
+# - Double-click items in **Objects** to edit defaults; double-click color icon to recolor.
 #
 # Run
 # - Install: `pip install PySide6`
@@ -65,6 +65,8 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QStyle,
+    QStyleOptionViewItem,
     QSpinBox,
     QTabWidget,
     QToolBar,
@@ -1839,12 +1841,6 @@ class PaletteList(QListWidget):
             if final_name != spec.name:
                 spec.name = final_name
                 changed = True
-        # Edit color
-        color = QColorDialog.getColor(spec.fill, self, "Choose color")
-        if color.isValid():
-            if color != spec.fill:
-                spec.fill = QColor(color)
-                changed = True
         # Edit size
         width, ok_w = QInputDialog.getInt(
             self,
@@ -1940,6 +1936,31 @@ class PaletteList(QListWidget):
                 spec.limit_key = new_limit_key
                 changed = True
         self._finalize_spec_change(item, spec, previous, changed)
+
+    def _double_click_hits_icon(self, item: QListWidgetItem, event) -> bool:
+        index = self.indexFromItem(item)
+        if not index.isValid():
+            return False
+        option = QStyleOptionViewItem(self.viewOptions())
+        option.rect = self.visualRect(index)
+        delegate = self.itemDelegate()
+        if delegate is not None:
+            delegate.initStyleOption(option, index)
+        decoration_rect = self.style().subElementRect(
+            QStyle.SE_ItemViewItemDecoration, option, self
+        )
+        pos = event.position().toPoint()
+        return decoration_rect.contains(pos)
+
+    def mouseDoubleClickEvent(self, event):
+        item = self.itemAt(event.position().toPoint())
+        if item is not None:
+            spec = item.data(Qt.UserRole)
+            if isinstance(spec, ObjectSpec) and self._double_click_hits_icon(item, event):
+                self._change_item_color(item, spec)
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
 
     def _notify_spec_changed(self, spec: ObjectSpec, previous: dict) -> None:
         parent = self.parent()
@@ -2167,6 +2188,7 @@ class AllianceMembersTab(QWidget):
             self.filter_combo.addItem(rank)
         filter_row.addWidget(self.filter_combo)
         self.sort_checkbox = QCheckBox("Sort by rank", self)
+        self.sort_checkbox.setChecked(True)
         filter_row.addWidget(self.sort_checkbox)
         filter_row.addStretch(1)
         layout.addLayout(filter_row)
@@ -2220,7 +2242,7 @@ class AllianceMembersTab(QWidget):
         else:
             filtered = list(self.members)
         if self.sort_checkbox.isChecked():
-            filtered.sort(key=lambda m: (RANK_ORDER.index(m.rank), m.name.lower()))
+            filtered.sort(key=lambda m: (-RANK_ORDER.index(m.rank), m.name.lower()))
         self.member_list.blockSignals(True)
         self.member_list.clear()
         selected_item: Optional[QListWidgetItem] = None
